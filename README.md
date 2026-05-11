@@ -27,6 +27,24 @@ This tool is for **single-user local use**. It is **not** hardened as a public i
 
 Copy `.env.example` to `.env` and fill in values. **Never commit `.env`.**
 
+## Git (SSH)
+
+Upstream: [equationalapplications/crosspost-publish](https://github.com/equationalapplications/crosspost-publish) on GitHub. Use **SSH** for `git clone` and `git push`:
+
+```bash
+git clone git@github.com:equationalapplications/crosspost-publish.git
+cd crosspost-publish
+```
+
+If `origin` is already set to HTTPS, switch it to SSH:
+
+```bash
+git remote set-url origin git@github.com:equationalapplications/crosspost-publish.git
+git push -u origin main
+```
+
+Add an SSH key to your GitHub account and confirm access with `ssh -T git@github.com` before pushing.
+
 ## LinkedIn image flow (API `202405`)
 
 For posts **with an image**, the API server runs the same three steps Microsoft documents for UGC images:
