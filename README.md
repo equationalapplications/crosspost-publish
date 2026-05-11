@@ -27,6 +27,16 @@ This tool is for **single-user local use**. It is **not** hardened as a public i
 
 Copy `.env.example` to `.env` and fill in values. **Never commit `.env`.**
 
+## LinkedIn image flow (API `202405`)
+
+For posts **with an image**, the API server runs the same three steps Microsoft documents for UGC images:
+
+1. **`POST https://api.linkedin.com/v2/assets?action=registerUpload`** — JSON body includes `registerUploadRequest` with `recipes`, `owner` (`urn:li:person:…`), and `serviceRelationships`. Response yields `uploadUrl` and `urn:li:digitalmediaAsset:…`.
+2. **`PUT` the file bytes** to `uploadUrl` with headers **`Authorization: Bearer …`**, **`Content-Type: application/octet-stream`**, **`Linkedin-Version: 202405`**, and **`X-Restli-Protocol-Version: 2.0.0`**.
+3. **`POST https://api.linkedin.com/v2/ugcPosts`** — `shareMediaCategory: IMAGE` and `media: [{ status: "READY", media: "<asset URN>" }]`.
+
+Between steps 2 and 3, the server **polls** `GET https://api.linkedin.com/rest/assets/{assetId}?fields=recipes,id` until a `recipes[]` entry has **`status: AVAILABLE`**, or (if that GET is not usable) waits **~1.5s** before creating the UGC post. Very large assets may still need a longer wait or manual retry.
+
 ## Run locally (development)
 
 Two processes: Vite on **5173** (proxies `/api` → API) and the API on **3001**.
