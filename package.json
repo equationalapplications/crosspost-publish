@@ -13,7 +13,8 @@
     "build:server": "tsc -p tsconfig.server.json",
     "start": "node dist/server/index.js",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "linkedin:post": "node --import dotenv/config scripts/linkedin-ugc-post.mjs"
   },
   "dependencies": {
     "@atproto/api": "^0.19.16",

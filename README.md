@@ -69,6 +69,27 @@ Open `http://127.0.0.1:3001` (or whatever `API_PORT` is).
 | `npm run build` | `vite build` + compile `server/` to `dist/server`. |
 | `npm start` | Run compiled API from `dist/server`. |
 | `npm run lint` | ESLint. |
+| `npm run linkedin:post` | CLI wrapper; pass args after `--` (see below). |
+
+## Standalone LinkedIn CLI (Node only)
+
+`scripts/linkedin-ugc-post.mjs` is a **zero-extra-package** Node 20+ script that runs the same **202405** UGC flow as the server (text-only or text + one image). From the repo root, load `.env` with Node’s built-in module hook (uses the repo’s `dotenv` dependency):
+
+```bash
+# text only
+node --import dotenv/config scripts/linkedin-ugc-post.mjs "Hello from the CLI"
+
+# text + image
+node --import dotenv/config scripts/linkedin-ugc-post.mjs "Photo day" ./photo.jpg
+```
+
+Or via npm (note the `--` before script arguments):
+
+```bash
+npm run linkedin:post -- "Hello from npm" ./photo.jpg
+```
+
+If you prefer not to use `dotenv`, set `LINKEDIN_ACCESS_TOKEN` and `LINKEDIN_PERSON_URN` in the shell, or use `node --env-file=.env` (Node 20+) when you keep secrets in `.env`.
 
 ## Adding another network later
 
