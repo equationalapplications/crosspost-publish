@@ -5,7 +5,7 @@
 
 ## Purpose
 
-A **local web application** the author runs on their machine (e.g. `http://localhost:3000`). They compose a **single** social post once—**text plus at most one image**—then publish **immediately** to **Bluesky** and **LinkedIn (personal profile)**. Additional networks are **out of scope for v1** but the architecture must make them easy to add later.
+A **local web application** the author runs on their machine (e.g. Vite dev server on `http://localhost:5173` with API proxied or a single documented local URL). They compose a **single** social post once—**text plus at most one image**—then publish **immediately** to **Bluesky** and **LinkedIn (personal profile)**. Additional networks are **out of scope for v1** but the architecture must make them easy to add later.
 
 ## Goals
 
@@ -34,12 +34,17 @@ A **local web application** the author runs on their machine (e.g. `http://local
 
 ## Architecture
 
-**Single full-stack Node app** (current scaffold: Next.js App Router) serving:
+**React + Vite** for the **browser UI** (composer, toggles, image preview, publish button, results list). **Next.js is explicitly out of scope** — no App Router, no RSC requirement for v1.
 
-1. **Client UI** — composer, toggles, image preview, publish button, results list.
-2. **Server route** — e.g. `POST /api/publish` (multipart: `text`, optional `image`, flags for enabled destinations).
+Secrets and third-party APIs **cannot** live in the Vite client bundle. Use a **small Node HTTP API** in the same repo (e.g. Express, Hono, or Node’s built-in `http`) that exposes at least:
 
-All third-party API calls and `process.env` access occur **only on the server**. The browser never receives raw secrets.
+- `POST /api/publish` — `multipart/form-data`: `text`, optional `image`, flags for enabled destinations; JSON response of per-network results.
+
+**Dev ergonomics:** either (a) run API and Vite concurrently with **Vite `server.proxy`** forwarding `/api` to the API port, or (b) one Node process that embeds Vite middleware in dev and serves `dist/` plus API in production. Pick one pattern at implementation time; both are valid.
+
+**Production / local “build” run:** one process that serves the Vite `dist/` static assets and mounts the same `/api/publish` handler, **or** documented two-port setup — README must spell out the supported command(s).
+
+All third-party API calls and `process.env` access occur **only on the Node API**. The browser never receives raw secrets.
 
 ### Publisher plugin pattern
 
@@ -108,6 +113,7 @@ These constraints apply to **all** commits intended for the public default branc
 
 ## Open points for implementation (not blockers for this spec)
 
+- Replace any existing **Next.js** scaffold with **Vite + React** and the Node API layout above; do not ship both frameworks.
 - Exact env var names and minimal README screenshots (no PII).
 - Max upload size and concurrent vs sequential publisher calls.
 - Exact LinkedIn API version and error mapping to user-visible strings.
