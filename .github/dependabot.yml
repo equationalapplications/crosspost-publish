@@ -23,6 +23,7 @@ updates:
 # Re-opening of a registered alert = register review trigger, not noise.
 # Entries:
 # - shell-quote|2: deferred — dev-only via concurrently@9.2.1 (requires exactly
-#   1.8.3; patched 1.8.4 rejected by parent). GHSA-5hh2-7jqc-4c9q exploits
-#   quote() with newline-carrying object .op values — dev CLI tool, not
-#   exposed. Retry when concurrently ships >9.2.1. Investigated 2026-10-02.
+#   1.8.3; patched 1.8.4 rejected by parent). GHSA-w7jw-789q-3m8p (critical,
+#   CVSS 8.1) exploits quote() with newline-carrying object .op values — dev
+#   CLI tool, not exposed. Retry when concurrently ships >9.2.1.
+#   Issue-gated: #23 (quarterly reassess from 2027-01-02). Investigated 2026-10-02.
