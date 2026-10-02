@@ -4,8 +4,25 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      # 14-day supply-chain SOP alignment; security updates bypass it
+      default-days: 14
     groups:
       minor-and-patch:
         update-types:
           - "minor"
           - "patch"
+    open-pull-requests-limit: 10
+
+# ── Security decision register (investigated alerts NOT auto-fixed) ─────────
+# Key: <package>|<alert-number>. status ∈ deferred | wontfix | fixed-awaiting-scan
+# deferred = an upstream parent pins/blocks the patched version; retry on parent
+#            upgrade. wontfix = risk accepted after investigation.
+# This register is documentation + sweep cross-check. Where Dependabot's fix
+# would break the build, add an `ignore` above AND cite the register key.
+# Re-opening of a registered alert = register review trigger, not noise.
+# Entries:
+# - shell-quote|2: deferred — dev-only via concurrently@9.2.1 (requires exactly
+#   1.8.3; patched 1.8.4 rejected by parent). GHSA-5hh2-7jqc-4c9q exploits
+#   quote() with newline-carrying object .op values — dev CLI tool, not
+#   exposed. Retry when concurrently ships >9.2.1. Investigated 2026-10-02.
