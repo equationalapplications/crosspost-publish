@@ -20,7 +20,7 @@
     "@atproto/api": "^0.25.0",
     "dotenv": "^18.0.7",
     "express": "^5.3.0",
-    "multer": "^2.4.0",
+    "multer": "^2.5.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
