@@ -104,7 +104,8 @@ account, so attribution requires per-identity keys.
   per-network with a message naming the missing env var (registry.ts).
 - Identity discovery: the client cannot see env vars, so an existing endpoint reports
   which dev.to identities are configured (`/api/health` gains a `devtoIdentities`
-  field); the identity selector shows whenever more than one identity is configured,
+  field, ordered Kurt first when both keys are set); the identity selector shows
+  whenever more than one identity is configured,
   and defaults to the first entry.
 
 ### 4. Attribution (one code guard + usage conventions)
@@ -164,7 +165,9 @@ account, so attribution requires per-identity keys.
 - UI-guard test (jsdom + testing-library): with `devto` in the request, the dev.to
   target locks at submit; an `ok` row or 4xx devto row releases it; after an
   unknown-outcome failure it stays locked until the "checked dev.to" confirmation
-  (Reset alone does not release it, nor does editing the title/body).
+  (Reset alone does not release it, nor does editing the title/body), and a
+  reload case: re-mount with the pending flag in `sessionStorage` after an
+  unknown-outcome failure and assert the lock still holds.
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
