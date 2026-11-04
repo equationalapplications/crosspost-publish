@@ -43,11 +43,16 @@ account, so attribution requires per-identity keys.
   Because `publishAll` sends to all targets in one request — and a transport-level
   failure (proxy reset, server crash mid-publish) can leave the outcome unknown with
   no result row at all — the UI locks the dev.to target at submit time whenever
-  `devto` was in the request, before any response arrives. It unlocks only on a
-  deterministic non-create failure (a 4xx result row for devto) or via a fresh form
-  (the Reset button, or editing the article title/body). Pressing Publish again can
+  `devto` was in the request, before any response arrives. It unlocks only per the
+  unlock rule below. Pressing Publish again can
   therefore never blindly re-create a live article. On success the article id/url is
   returned to the UI in the result (no server-side store; the app is stateless).
+- Unlock rule, precisely: an `ok: true` result row or a deterministic 4xx devto row
+  releases the lock automatically. An unknown-outcome failure (transport error,
+  timeout, 5xx — the article may exist) keeps the dev.to target locked until the user
+  ticks a "checked dev.to — no duplicate article" confirmation backed by
+  `GET /api/articles/me` or the dashboard; Reset clears the form but not that
+  requirement, so editing text alone can never re-arm a blind re-publish.
 
 ### 2. Article payload (long-form extends the context)
 
@@ -79,8 +84,9 @@ account, so attribution requires per-identity keys.
 
 - `DEVTO_API_KEY` — Kurt's account (primary).
 - `DEVTO_API_KEY_TESSERA` — Tessera's account (optional; added when the account exists).
-- UI: a dev.to target checkbox plus an identity selector (Kurt / Tessera) shown only
-  when a second key is configured. Per-network success/failure reporting unchanged
+- UI: a dev.to target checkbox plus an identity selector (Kurt / Tessera); its
+  visibility is derived from `devtoIdentities` (shown when more than one identity is
+  configured). Per-network success/failure reporting unchanged
   (identity is part of the result message).
 - Wire contract: the client sends `devtoIdentity: "kurt" | "tessera"` — a closed enum,
   never free text and never an API key. When `devto: true`, the server maps the enum
@@ -150,8 +156,9 @@ account, so attribution requires per-identity keys.
   outbound request and a "check manually" failure result (no auto-retry); the response
   carries the article id/url on success.
 - UI-guard test (jsdom + testing-library): with `devto` in the request, the dev.to
-  target is locked from submit until a 4xx devto result row, a Reset, or an
-  article title/body edit.
+  target locks at submit; an `ok` row or 4xx devto row releases it; after an
+  unknown-outcome failure it stays locked until the "checked dev.to" confirmation
+  (Reset alone does not release it, nor does editing the title/body).
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
