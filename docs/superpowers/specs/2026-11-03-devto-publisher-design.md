@@ -25,7 +25,8 @@ account, so attribution requires per-identity keys.
   (https://developers.forem.com/api): the endpoint, `api-key` header, body shape,
   tags max 4 (the API takes them as a comma-separated string), and
   `GET /api/articles/me` are all confirmed; `description` has no schema maxLength —
-  the ~140 cap is a dev.to-side convention, so treat it as a soft validation limit.
+  the ~140 cap is a dev.to-side convention: not enforced server-side; the UI shows a
+  character counter.
 - Returns `{ networkId: "devto", ok, externalId: <article id>, url, message? }`; the UI
   links to the returned `url` on success. `PublishResult` (types.ts) gains an optional
   `url?: string` populated from the Forem response — dev.to article URLs are not
@@ -39,11 +40,14 @@ account, so attribution requires per-identity keys.
   dashboard (a 5xx may mean "created but response lost" — re-posting blind can
   duplicate the article). The request carries an explicit timeout (30 s via
   AbortSignal); an abort after the bytes were sent is treated as a possible create.
-  Because `publishAll` sends to all targets in one request, the UI also guards manual
-  resubmits: after a dev.to success or a "check manually" failure, the dev.to target
-  is unchecked/locked (re-enable requires a fresh form) so pressing Publish again
-  cannot create a second live article. On success the article id/url is returned to
-  the UI in the result (no server-side store; the app is stateless).
+  Because `publishAll` sends to all targets in one request — and a transport-level
+  failure (proxy reset, server crash mid-publish) can leave the outcome unknown with
+  no result row at all — the UI locks the dev.to target at submit time whenever
+  `devto` was in the request, before any response arrives. It unlocks only on a
+  deterministic non-create failure (a 4xx result row for devto) or via a fresh form
+  (the Reset button, or editing the article title/body). Pressing Publish again can
+  therefore never blindly re-create a live article. On success the article id/url is
+  returned to the UI in the result (no server-side store; the app is stateless).
 
 ### 2. Article payload (long-form extends the context)
 
@@ -52,7 +56,8 @@ account, so attribution requires per-identity keys.
   required (≤ 400,000 characters), ≤ 4 tags (normalized to lowercase alphanumeric
   before submit — dev.to rejects other characters with a 422), canonicalUrl must be
   https with `URL.hostname` exactly `equationalapplications.com` when present (no
-  www/subdomains).
+  www/subdomains). Note: confirm ea-site's canonical URLs are on the apex host (not
+  www) before implementation — a mismatch would 400 every real post.
 - `/api/publish` request rules with dev.to in the mix:
   - `text` is required only when Bluesky or LinkedIn is targeted (a dev.to-only
     publish has no short-form text).
@@ -78,14 +83,17 @@ account, so attribution requires per-identity keys.
   when a second key is configured. Per-network success/failure reporting unchanged
   (identity is part of the result message).
 - Wire contract: the client sends `devtoIdentity: "kurt" | "tessera"` — a closed enum,
-  never free text and never an API key. The server maps the enum to the corresponding
-  env var and rejects unknown values with 400; an omitted `devtoIdentity` defaults to
-  `"kurt"`. `PublishTargets` gains `devto: boolean` plus this identity carrier
+  never free text and never an API key. When `devto: true`, the server maps the enum
+  to the corresponding env var and rejects unknown values with 400 (a stale identity
+  on a Bluesky-only request is ignored, not a 400); an omitted `devtoIdentity`
+  defaults to the first entry of `devtoIdentities` from `/api/health` (Kurt when both
+  keys are set). `PublishTargets` gains `devto: boolean` plus this identity carrier
   (server/publishers/types.ts). A publish whose identity's key is not configured fails
   per-network with a message naming the missing env var (registry.ts).
 - Identity discovery: the client cannot see env vars, so an existing endpoint reports
   which dev.to identities are configured (`/api/health` gains a `devtoIdentities`
-  field); the UI derives the selector's visibility from that.
+  field); the identity selector shows whenever more than one identity is configured,
+  and defaults to the first entry.
 
 ### 4. Attribution (one code guard + usage conventions)
 
@@ -93,8 +101,10 @@ account, so attribution requires per-identity keys.
   "Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications."
   This one rule is code-enforced: when `devtoIdentity` is `"tessera"`, the server
   requires the disclosure line in `bodyMarkdown` (400 if missing) — disclosure is why
-  dev.to was chosen over Medium, so it cannot ride on memory alone. Kurt's own posts
-  are not policed.
+  dev.to was chosen over Medium, so it cannot ride on memory alone. Match rule: a
+  case-insensitive, whitespace-normalised substring match anywhere in `bodyMarkdown`;
+  the "first paragraph" placement stays conventional. Kurt's own posts are not
+  policed.
 - canonical_url points at the canonical post on equationalapplications.com (site is
   always published first — a usage convention only; the site-publish leg lives outside
   this app, so there is no in-app enforcement).
@@ -107,9 +117,18 @@ account, so attribution requires per-identity keys.
 
 ## Files touched
 
-- `server/publishers/types.ts`, `registry.ts`, `devto.ts` (new)
-- `server/index.ts` (route fields + validation)
-- `src/App.tsx` (dev.to checkbox, article fields, identity selector)
+- `server/publishers/types.ts`, `registry.ts`, `devto.ts` (new),
+  `devto-validation.ts` (new: pure module holding article validation, the
+  disclosure-guard match, and the request-rule branching — the route handler
+  currently inlines all of this and calls `app.listen` at module load, so the rules
+  are unimportable for tests; the route imports from the new module)
+- `server/index.ts` (route fields + validation, `express.json()`, `/api/health`
+  `devtoIdentities` field)
+- `src/App.tsx` (dev.to checkbox, article fields, identity selector, submit-time
+  dev.to lock)
+- Test infrastructure: `vitest` (+ `jsdom` and `@testing-library/react` for the
+  UI-guard test) as devDependencies, and a `test` script in `package.json` (the repo
+  currently has none)
 - `.env.example`, `README.md`
 - `scripts/validate-devto.mjs` (new; mirrors `scripts/validate-bluesky.mjs` — that
   mirror target is currently untracked working-tree content and is committed in the
@@ -119,17 +138,20 @@ account, so attribution requires per-identity keys.
 ## Test plan
 
 - ESLint + build pass.
-- Unit tests for the new pure logic: article-field validation (title ≤ 128, ≤ 4 tags,
-  tag normalization, canonicalUrl exact-host rule, body ≤ 400k characters),
-  identity→key resolution (default `kurt`, unknown → 400, missing-key message), the
-  disclosure-line guard for the tessera identity, and the request-rule branching in
-  `server/index.ts` (dev.to-only publish, `devto` without `article` → 400, `article`
-  without `devto` → 400, article+image → 400, no-destination → 400).
+- `npm test` (vitest): unit tests against `server/publishers/devto-validation.ts` for
+  article-field validation (title ≤ 128, ≤ 4 tags, tag normalization, canonicalUrl
+  exact-host rule, body ≤ 400k characters, description counter-surface only), the
+  disclosure-line guard (case/whitespace-normalised substring), and the request-rule
+  branching (dev.to-only publish, `devto` without `article` → 400, `article` without
+  `devto` → 400, article+image → 400, no-destination → 400, stale identity on a
+  non-devto request ignored); identity→key resolution tests (default = first
+  `devtoIdentities` entry, unknown + `devto` → 400, missing-key message).
 - Retry-rule unit test: a timeout or 5xx on `POST /api/articles` produces exactly one
   outbound request and a "check manually" failure result (no auto-retry); the response
   carries the article id/url on success.
-- UI-guard test: after a dev.to success or "check manually" failure, the dev.to target
-  is unchecked/locked on the next submit.
+- UI-guard test (jsdom + testing-library): with `devto` in the request, the dev.to
+  target is locked from submit until a 4xx devto result row, a Reset, or an
+  article title/body edit.
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
@@ -138,3 +160,7 @@ account, so attribution requires per-identity keys.
 
 - Cross-posting of Bluesky/LinkedIn content *from* dev.to, comments, or stats.
 - Multiple dev.to organizations / publications.
+- Draft-then-publish (create with `published: false`, then flip to `published: true`
+  via the update endpoint): considered by review as a stronger duplicate defence, but
+  it adds a second API round-trip and a partial-state surface for v1's
+  single-shot, human-in-the-loop flow. Revisit if duplicate-article incidents occur.
