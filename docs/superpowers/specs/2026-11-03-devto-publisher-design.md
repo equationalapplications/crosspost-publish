@@ -26,15 +26,23 @@ account, so attribution requires per-identity keys.
   to the returned `url` on success.
 - No image support in v1 (dev.to images live in the markdown body; remote URLs only).
   The one-image flow stays Bluesky/LinkedIn-only.
+- Retry rule: `POST /api/articles` with `published: true` creates a new live article on
+  every successful call (non-idempotent). dev.to publishes are never auto-retried; if
+  the request times out, surface the failure for manual re-check instead of retrying.
+  Persist the returned article id/url on success.
 
 ### 2. Article payload (long-form extends the context)
 
 - `PublishContext` gains an optional `article?: { title, bodyMarkdown, canonicalUrl?,
   description?, tags?: string[] }`. Present only when dev.to is targeted. Validation:
   title required (≤ 128), bodyMarkdown required (≤ 400k), ≤ 4 tags, canonicalUrl must be
-  https when present.
+  https on the equationalapplications.com host when present.
 - `/api/publish` accepts the new fields (JSON body variant; multipart path unchanged
-  when no article fields are sent).
+  when no article fields are sent). `server/index.ts` today has no `express.json()` —
+  every request goes through `upload.single("image")` (multer multipart) — so the
+  implementation adds `express.json()` alongside it: multer handles multipart
+  requests, JSON parsing handles the rest. Requests combining article fields with an
+  image are rejected with 400 (dev.to has no image support in v1).
 
 ### 3. Two dev.to identities
 
@@ -43,13 +51,18 @@ account, so attribution requires per-identity keys.
 - UI: a dev.to target checkbox plus an identity selector (Kurt / Tessera) shown only
   when a second key is configured. Per-network success/failure reporting unchanged
   (identity is part of the result message).
+- Wire contract: the client sends `devtoIdentity: "kurt" | "tessera"` — a closed enum,
+  never free text and never an API key. The server maps the enum to the corresponding
+  env var and rejects unknown values with 400. `PublishTargets` gains `devto: boolean`
+  plus this identity carrier (server/publishers/types.ts).
 
 ### 4. Attribution convention (usage, not code enforcement)
 
 - Tessera-authored posts carry a disclosure line in the first paragraph:
   "Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications."
 - canonical_url points at the canonical post on equationalapplications.com (site is
-  always published first).
+  always published first — a usage convention only; the site-publish leg lives outside
+  this app, so there is no in-app enforcement).
 
 ### 5. Config + docs
 
@@ -63,12 +76,16 @@ account, so attribution requires per-identity keys.
 - `server/index.ts` (route fields + validation)
 - `src/App.tsx` (dev.to checkbox, article fields, identity selector)
 - `.env.example`, `README.md`
-- `scripts/validate-devto.mjs` (new; mirrors validate-bluesky.mjs: checks key works via
-  `GET /api/articles/me`)
+- `scripts/validate-devto.mjs` (new; mirrors `scripts/validate-bluesky.mjs` — that
+  mirror target is currently untracked working-tree content and is committed in this
+  PR alongside the implementation: checks key works via `GET /api/articles/me`)
 
 ## Test plan
 
 - ESLint + build pass.
+- Unit tests for the new pure logic: article-field validation (title ≤ 128, ≤ 4 tags,
+  canonicalUrl host rule, body ≤ 400k), identity→key resolution, and the
+  JSON-vs-multipart branching in `server/index.ts`.
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
