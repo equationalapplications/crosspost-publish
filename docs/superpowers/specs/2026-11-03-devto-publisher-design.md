@@ -18,7 +18,8 @@ account, so attribution requires per-identity keys.
 
 ### 1. Publisher: `server/publishers/devto.ts`
 
-- Forem API v1: `POST https://dev.to/api/articles`, header `api-key: <key>`; JSON body
+- Forem API v1: `POST https://dev.to/api/articles` with the `api-key` header carrying
+  the key; JSON body
   `{ article: { title, body_markdown, published: true, canonical_url?, description?,
   tags? } }`. Verified 2026-11-04 against the Forem OpenAPI spec
   (https://developers.forem.com/api): the endpoint, `api-key` header, body shape,
@@ -36,22 +37,38 @@ account, so attribution requires per-identity keys.
   the request times out, surface the failure for manual re-check instead of retrying,
   with the failure message pointing the user at `GET /api/articles/me` or their dev.to
   dashboard (a 5xx may mean "created but response lost" — re-posting blind can
-  duplicate the article). On success the article id/url is returned to the UI in the
-  result (no server-side store; the app is stateless).
+  duplicate the article). The request carries an explicit timeout (30 s via
+  AbortSignal); an abort after the bytes were sent is treated as a possible create.
+  Because `publishAll` sends to all targets in one request, the UI also guards manual
+  resubmits: after a dev.to success or a "check manually" failure, the dev.to target
+  is unchecked/locked (re-enable requires a fresh form) so pressing Publish again
+  cannot create a second live article. On success the article id/url is returned to
+  the UI in the result (no server-side store; the app is stateless).
 
 ### 2. Article payload (long-form extends the context)
 
 - `PublishContext` gains an optional `article?: { title, bodyMarkdown, canonicalUrl?,
-  description?, tags?: string[] }`. Present only when dev.to is targeted. Validation:
-  title required (≤ 128), bodyMarkdown required (≤ 400k), ≤ 4 tags, canonicalUrl must be
-  https on the equationalapplications.com host when present.
+  description?, tags?: string[] }`. Validation: title required (≤ 128), bodyMarkdown
+  required (≤ 400,000 characters), ≤ 4 tags (normalized to lowercase alphanumeric
+  before submit — dev.to rejects other characters with a 422), canonicalUrl must be
+  https with `URL.hostname` exactly `equationalapplications.com` when present (no
+  www/subdomains).
+- `/api/publish` request rules with dev.to in the mix:
+  - `text` is required only when Bluesky or LinkedIn is targeted (a dev.to-only
+    publish has no short-form text).
+  - `devto: true` requires `article`; missing article → 400. `article` sent without
+    `devto: true` → 400.
+  - the "at least one destination" check includes `devto`.
 - `/api/publish` accepts the new fields (JSON body variant; multipart path unchanged
   when no article fields are sent). `server/index.ts` today has no `express.json()` —
   every request goes through `upload.single("image")` (multer multipart) — so the
-  implementation adds `express.json()` alongside it — with a raised JSON body limit
-  (Express defaults to 100kb, which would 413 a ≤400k `bodyMarkdown`): multer handles
-  multipart requests, JSON parsing handles the rest. Requests combining article
-  fields with an image are rejected with 400 (dev.to has no image support in v1).
+  implementation adds `express.json()` alongside it — with a JSON body limit of `2mb`
+  (Express defaults to 100kb, which would 413 a ≤400k-character non-ASCII
+  `bodyMarkdown`; 2mb covers the worst case): multer handles
+  multipart requests, JSON parsing handles the rest. A request combining article
+  fields with an image is rejected with 400 (dev.to has no image support in v1), and
+  the UI disables the image picker when the dev.to checkbox is set so users never hit
+  that 400.
 
 ### 3. Two dev.to identities
 
@@ -62,13 +79,22 @@ account, so attribution requires per-identity keys.
   (identity is part of the result message).
 - Wire contract: the client sends `devtoIdentity: "kurt" | "tessera"` — a closed enum,
   never free text and never an API key. The server maps the enum to the corresponding
-  env var and rejects unknown values with 400. `PublishTargets` gains `devto: boolean`
-  plus this identity carrier (server/publishers/types.ts).
+  env var and rejects unknown values with 400; an omitted `devtoIdentity` defaults to
+  `"kurt"`. `PublishTargets` gains `devto: boolean` plus this identity carrier
+  (server/publishers/types.ts). A publish whose identity's key is not configured fails
+  per-network with a message naming the missing env var (registry.ts).
+- Identity discovery: the client cannot see env vars, so an existing endpoint reports
+  which dev.to identities are configured (`/api/health` gains a `devtoIdentities`
+  field); the UI derives the selector's visibility from that.
 
-### 4. Attribution convention (usage, not code enforcement)
+### 4. Attribution (one code guard + usage conventions)
 
-- Tessera-authored posts carry a disclosure line in the first paragraph:
+- Tessera-authored posts carry the disclosure line in the first paragraph:
   "Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications."
+  This one rule is code-enforced: when `devtoIdentity` is `"tessera"`, the server
+  requires the disclosure line in `bodyMarkdown` (400 if missing) — disclosure is why
+  dev.to was chosen over Medium, so it cannot ride on memory alone. Kurt's own posts
+  are not policed.
 - canonical_url points at the canonical post on equationalapplications.com (site is
   always published first — a usage convention only; the site-publish leg lives outside
   this app, so there is no in-app enforcement).
@@ -86,18 +112,24 @@ account, so attribution requires per-identity keys.
 - `src/App.tsx` (dev.to checkbox, article fields, identity selector)
 - `.env.example`, `README.md`
 - `scripts/validate-devto.mjs` (new; mirrors `scripts/validate-bluesky.mjs` — that
-  mirror target is currently untracked working-tree content and is committed in this
-  PR alongside the implementation: checks key works via `GET /api/articles/me`)
+  mirror target is currently untracked working-tree content and is committed in the
+  implementation PR alongside this feature: checks key works via
+  `GET /api/articles/me`)
 
 ## Test plan
 
 - ESLint + build pass.
 - Unit tests for the new pure logic: article-field validation (title ≤ 128, ≤ 4 tags,
-  canonicalUrl host rule, body ≤ 400k), identity→key resolution, and the
-  JSON-vs-multipart branching in `server/index.ts`.
+  tag normalization, canonicalUrl exact-host rule, body ≤ 400k characters),
+  identity→key resolution (default `kurt`, unknown → 400, missing-key message), the
+  disclosure-line guard for the tessera identity, and the request-rule branching in
+  `server/index.ts` (dev.to-only publish, `devto` without `article` → 400, `article`
+  without `devto` → 400, article+image → 400, no-destination → 400).
 - Retry-rule unit test: a timeout or 5xx on `POST /api/articles` produces exactly one
   outbound request and a "check manually" failure result (no auto-retry); the response
   carries the article id/url on success.
+- UI-guard test: after a dev.to success or "check manually" failure, the dev.to target
+  is unchecked/locked on the next submit.
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
