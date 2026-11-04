@@ -25,14 +25,19 @@ account, so attribution requires per-identity keys.
   tags max 4 (the API takes them as a comma-separated string), and
   `GET /api/articles/me` are all confirmed; `description` has no schema maxLength —
   the ~140 cap is a dev.to-side convention, so treat it as a soft validation limit.
-- Returns `{ networkId: "devto", ok, externalId: <article id>, message? }`; the UI links
-  to the returned `url` on success.
+- Returns `{ networkId: "devto", ok, externalId: <article id>, url, message? }`; the UI
+  links to the returned `url` on success. `PublishResult` (types.ts) gains an optional
+  `url?: string` populated from the Forem response — dev.to article URLs are not
+  derivable from the id alone.
 - No image support in v1 (dev.to images live in the markdown body; remote URLs only).
   The one-image flow stays Bluesky/LinkedIn-only.
 - Retry rule: `POST /api/articles` with `published: true` creates a new live article on
   every successful call (non-idempotent). dev.to publishes are never auto-retried; if
-  the request times out, surface the failure for manual re-check instead of retrying.
-  Persist the returned article id/url on success.
+  the request times out, surface the failure for manual re-check instead of retrying,
+  with the failure message pointing the user at `GET /api/articles/me` or their dev.to
+  dashboard (a 5xx may mean "created but response lost" — re-posting blind can
+  duplicate the article). On success the article id/url is returned to the UI in the
+  result (no server-side store; the app is stateless).
 
 ### 2. Article payload (long-form extends the context)
 
@@ -43,9 +48,10 @@ account, so attribution requires per-identity keys.
 - `/api/publish` accepts the new fields (JSON body variant; multipart path unchanged
   when no article fields are sent). `server/index.ts` today has no `express.json()` —
   every request goes through `upload.single("image")` (multer multipart) — so the
-  implementation adds `express.json()` alongside it: multer handles multipart
-  requests, JSON parsing handles the rest. Requests combining article fields with an
-  image are rejected with 400 (dev.to has no image support in v1).
+  implementation adds `express.json()` alongside it — with a raised JSON body limit
+  (Express defaults to 100kb, which would 413 a ≤400k `bodyMarkdown`): multer handles
+  multipart requests, JSON parsing handles the rest. Requests combining article
+  fields with an image are rejected with 400 (dev.to has no image support in v1).
 
 ### 3. Two dev.to identities
 
@@ -90,8 +96,8 @@ account, so attribution requires per-identity keys.
   canonicalUrl host rule, body ≤ 400k), identity→key resolution, and the
   JSON-vs-multipart branching in `server/index.ts`.
 - Retry-rule unit test: a timeout or 5xx on `POST /api/articles` produces exactly one
-  outbound request and a "check manually" failure result (no auto-retry); the returned
-  article id/url is persisted on success.
+  outbound request and a "check manually" failure result (no auto-retry); the response
+  carries the article id/url on success.
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
