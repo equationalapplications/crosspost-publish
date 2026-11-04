@@ -44,8 +44,13 @@ account, so attribution requires per-identity keys.
   failure (proxy reset, server crash mid-publish) can leave the outcome unknown with
   no result row at all — the UI locks the dev.to target at submit time whenever
   `devto` was in the request, before any response arrives. It unlocks only per the
-  unlock rule below. Pressing Publish again can
-  therefore never blindly re-create a live article. On success the article id/url is
+  unlock rule below. Pressing Publish again in this session can therefore never
+  blindly re-create a live article: the pending dev.to flag persists in
+  `sessionStorage`, so a page reload does not clear the lock. The guarantee is
+  per-browser-tab — fully closing the tab clears it, at which point the dashboard
+  check is the guard. The "checked dev.to" tick is self-attested (the app has no
+  server-side store to verify against); an accepted v1 tradeoff. On success the
+  article id/url is
   returned to the UI in the result (no server-side store; the app is stateless).
 - Unlock rule, precisely: an `ok: true` result row or a deterministic 4xx devto row
   releases the lock automatically. An unknown-outcome failure (transport error,
@@ -61,8 +66,9 @@ account, so attribution requires per-identity keys.
   required (≤ 400,000 characters), ≤ 4 tags (normalized to lowercase alphanumeric
   before submit — dev.to rejects other characters with a 422), canonicalUrl must be
   https with `URL.hostname` exactly `equationalapplications.com` when present (no
-  www/subdomains). Note: confirm ea-site's canonical URLs are on the apex host (not
-  www) before implementation — a mismatch would 400 every real post.
+  www/subdomains). Verified 2026-11-04 against the live site: canonical tags are on
+  the apex host and www 301-redirects to apex, so the exact-host rule matches real
+  canonical URLs.
 - `/api/publish` request rules with dev.to in the mix:
   - `text` is required only when Bluesky or LinkedIn is targeted (a dev.to-only
     publish has no short-form text).
