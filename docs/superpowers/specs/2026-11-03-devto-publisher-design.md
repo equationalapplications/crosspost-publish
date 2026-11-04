@@ -18,10 +18,13 @@ account, so attribution requires per-identity keys.
 
 ### 1. Publisher: `server/publishers/devto.ts`
 
-- Forem API v1: `POST https://dev.to/api/articles`, header `api-key: <key>`, JSON body
+- Forem API v1: `POST https://dev.to/api/articles`, header `api-key: <key>`; JSON body
   `{ article: { title, body_markdown, published: true, canonical_url?, description?,
-  tags? } }` (tags max 4; description max ~140). Verify against
-  https://developers.forem.com/api before implementing.
+  tags? } }`. Verified 2026-11-04 against the Forem OpenAPI spec
+  (https://developers.forem.com/api): the endpoint, `api-key` header, body shape,
+  tags max 4 (the API takes them as a comma-separated string), and
+  `GET /api/articles/me` are all confirmed; `description` has no schema maxLength —
+  the ~140 cap is a dev.to-side convention, so treat it as a soft validation limit.
 - Returns `{ networkId: "devto", ok, externalId: <article id>, message? }`; the UI links
   to the returned `url` on success.
 - No image support in v1 (dev.to images live in the markdown body; remote URLs only).
@@ -86,6 +89,9 @@ account, so attribution requires per-identity keys.
 - Unit tests for the new pure logic: article-field validation (title ≤ 128, ≤ 4 tags,
   canonicalUrl host rule, body ≤ 400k), identity→key resolution, and the
   JSON-vs-multipart branching in `server/index.ts`.
+- Retry-rule unit test: a timeout or 5xx on `POST /api/articles` produces exactly one
+  outbound request and a "check manually" failure result (no auto-retry); the returned
+  article id/url is persisted on success.
 - validate-devto.mjs against a real key (manual, Kurt-provided).
 - First live post: re-publish the approved standing-privacy-modes post to Tessera's
   identity with canonical_url → the site note (after PR #109 on ea-site merges).
