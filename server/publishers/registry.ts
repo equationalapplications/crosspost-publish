@@ -1,7 +1,7 @@
 import { publishBluesky, isBlueskyConfigured } from "./bluesky.js";
 import { publishLinkedIn, isLinkedInConfigured } from "./linkedin.js";
 import { publishDevto } from "./devto.js";
-import { isDevtoKeyConfigured } from "./devto-validation.js";
+import { devtoEnvName, isDevtoKeyConfigured } from "./devto-validation.js";
 import type { DevtoIdentity, PublishContext, PublishResult, PublishTargets } from "./types.js";
 
 type Job = { label: string; networkId: string; promise: Promise<PublishResult> };
@@ -53,7 +53,7 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
     if (identity && isDevtoKeyConfigured(identity)) {
       jobs.push({ label: `dev.to (${identity})`, networkId: "devto", promise: publishDevto(ctx, identity) });
     } else {
-      const envName = identity === "tessera" ? "DEVTO_API_KEY_TESSERA" : "DEVTO_API_KEY";
+      const envName = identity ? devtoEnvName(identity) : "DEVTO_API_KEY";
       jobs.push({
         label: `dev.to (${identity ?? "unresolved"})`,
         networkId: "devto",

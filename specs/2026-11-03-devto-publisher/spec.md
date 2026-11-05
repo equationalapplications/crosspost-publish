@@ -1,8 +1,10 @@
 # dev.to as a third crosspost target (Tessera + Kurt)
 
 **Date:** 2026-11-03
-**Status:** Reviewed — approved by Kurt 2026-11-04 ~11 PM EST (chat ruling, delivery thread;
-spec review ladder converged 2026-11-04, ALL FINDINGS RESOLVED, ~$1.55 of the $3.25 ceiling)
+**Status:** Implemented — approved by Kurt 2026-11-04 ~11 PM EST (chat ruling, delivery thread;
+spec review ladder converged 2026-11-04, ALL FINDINGS RESOLVED, ~$1.55 of the $3.25 ceiling);
+implementation plan ladder converged 2026-11-05 ~00:10 EST (~$0.19); implemented + plan approved
+by Kurt 2026-11-05 ~06:05 EST (chat, option 1, incl. the two wording reconciliations above)
 **Requested by:** Kurt VanDusen, 2026-11-03: Medium is out (platform policy); use
 crosspost-publish to post to dev.to "for you [Tessera] to post more widely, as well as
 I will use it for my posts."
@@ -84,8 +86,9 @@ account, so attribution requires per-identity keys.
   `bodyMarkdown`; 2mb covers the worst case): multer handles
   multipart requests, JSON parsing handles the rest. A request combining article
   fields with an image is rejected with 400 (dev.to has no image support in v1), and
-  the UI disables the image picker when the dev.to checkbox is set so users never hit
-  that 400.
+  the UI disables the image picker when the dev.to checkbox is set AND not locked, so
+  users never hit that 400; while the dev.to lock is held the picker re-enables (a
+  locked dev.to target can never be sent, so Bluesky/LinkedIn keep image support)
 
 ### 3. Two dev.to identities
 
@@ -100,7 +103,9 @@ account, so attribution requires per-identity keys.
   to the corresponding env var and rejects unknown values with 400 (a stale identity
   on a Bluesky-only request is ignored, not a 400); an omitted `devtoIdentity`
   defaults to the first entry of `devtoIdentities` from `/api/health` (Kurt when both
-  keys are set). `PublishTargets` gains `devto: boolean` plus this identity carrier
+  keys are set). `PublishTargets` gains `devto?: boolean` (optional in the type so the
+  types commit compiles before the route sets it; the route always sets it) plus this
+  identity carrier
   (server/publishers/types.ts). A publish whose identity's key is not configured fails
   per-network with a message naming the missing env var (registry.ts).
 - Identity discovery: the client cannot see env vars, so an existing endpoint reports

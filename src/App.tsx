@@ -88,7 +88,7 @@ export default function App() {
     // NOTE: never touches crosspost.devtoPending or the confirmation requirement
   }, [onPickFile]);
 
-  const identityLabel = pendingIdentity ? pendingIdentity : null;
+  const identityLabel = pendingIdentity;
 
   const confirmDevto = useCallback(() => {
     sessionStorage.removeItem(DEVTO_PENDING_KEY);
@@ -97,7 +97,7 @@ export default function App() {
   }, []);
 
   const canPublish = useMemo(() => {
-    if (devto) {
+    if (devto && !devtoLocked) {
       if (!title.trim() || !bodyMarkdown.trim()) return false;
     } else {
       const trimmed = text.trim();
@@ -274,13 +274,12 @@ export default function App() {
             />
 
             <label className="field" htmlFor="description">
-              Description (~140 chars max; currently {description.length})
+              Description (dev.to recommends ~140 chars; currently {description.length})
             </label>
             <input
               id="description"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              maxLength={280}
             />
 
             <label className="field" htmlFor="tags">

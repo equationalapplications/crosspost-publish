@@ -67,6 +67,11 @@ const IDENTITY_ENV: Record<DevtoIdentity, string> = {
   tessera: "DEVTO_API_KEY_TESSERA",
 };
 
+/** Single source of truth for the env-var name of an identity (spec §identities). */
+export function devtoEnvName(identity: DevtoIdentity): string {
+  return IDENTITY_ENV[identity];
+}
+
 export function isDevtoKeyConfigured(identity: DevtoIdentity): boolean {
   return Boolean(process.env[IDENTITY_ENV[identity]]);
 }
@@ -88,7 +93,7 @@ function isDevtoIdentity(v: unknown): v is DevtoIdentity {
 export type PublishRequestRulesInput = {
   text?: unknown;
   targets: { bluesky: boolean; linkedin: boolean; devto: boolean };
-  article?: DevtoArticle | unknown;
+  article?: unknown;
   devtoIdentity?: unknown;
   hasImage: boolean;
 };

@@ -1,5 +1,5 @@
 import type { DevtoIdentity, PublishContext, PublishResult } from "./types.js";
-import { normalizeTags, resolveDevtoIdentityKey } from "./devto-validation.js";
+import { normalizeTags, devtoEnvName, resolveDevtoIdentityKey } from "./devto-validation.js";
 
 export const DEVTO_API_BASE = "https://dev.to/api";
 const TIMEOUT_MS = 30_000;
@@ -38,7 +38,7 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
   const networkId = "devto";
   const key = resolveDevtoIdentityKey(identity);
   if (!key) {
-    const envName = identity === "kurt" ? "DEVTO_API_KEY" : "DEVTO_API_KEY_TESSERA";
+    const envName = devtoEnvName(identity);
     return {
       networkId,
       ok: false,
@@ -108,7 +108,7 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
     networkId,
     ok: true,
     resultKind: "created",
-    externalId: parsed.id !== undefined ? String(parsed.id) : undefined,
+    externalId: String(parsed.id),
     url: parsed.url,
   };
 }
