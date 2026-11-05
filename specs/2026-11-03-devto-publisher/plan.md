@@ -21,7 +21,7 @@
 - Tessera-authored posts: the server 400s when `devtoIdentity` is `"tessera"` and `bodyMarkdown` lacks the disclosure line — case-insensitive, whitespace-normalised substring match. Disclosure line (exact string): `Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.`
 - `/api/publish` request rules: `text` required only when Bluesky or LinkedIn targeted; `devto: true` without `article` → 400; `article` without `devto: true` → 400; article fields + image → 400 (and the UI disables the image picker so users never hit it); at-least-one-destination check includes `devto`.
 - JSON body limit: `2mb` (per the approved spec — DO NOT raise it): `JSON.stringify` emits non-ASCII characters raw (UTF-8), so normal text peaks at ~1.2 MB for 400k CJK-range chars. Pathological control-character/lone-surrogate content escapes to ~2.4 MB and hits the 413 — acceptable: the 413 is a deterministic 4xx, the lock logic stays safe, and `validateArticle` length limits plus the UI maxlength keep real content far below the line. multer keeps handling multipart; `express.json()` handles JSON. The route's error middleware must pass through `express.json()`'s own 4xx statuses (400 malformed JSON, 413 over-limit) instead of rewriting them to 500 — the UI's unlock rule depends on deterministic 4xx being distinguishable from 5xx.
-- `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx or a nothing-sent failure (auto-unlocks the UI lock), `unknown` = timeout/5xx/transport (keeps it locked until the "checked dev.to" confirmation). Only devto rows carry it (`devto.ts` and the registry's unconfigured-key row); other publishers leave it undefined.
+- `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx or a nothing-sent failure (auto-unlocks the UI lock), `unknown` = timeout/5xx/429/transport error (ALL fetch throws are `unknown`, including DNS/ECONNREFUSED — fail-closed even though nothing may have been sent; keeps the lock until the confirmation). Only devto rows carry it (`devto.ts` and the registry's unconfigured-key row); other publishers and other networks' allSettled fallback rows leave it undefined. The UI unlock is fail-closed: only explicit `created`, explicit `rejected`, or a 4xx-without-devto-row unlocks. Every devto message names the identity (spec §per-network reporting) — `dev.to (tessera): …` — so a two-account user never checks the wrong dashboard.
 - Duplicate-article defence is client-side by design (stateless app): sessionStorage-backed submit-time lock, per-browser-tab; closing the tab clears it. Accepted v1 tradeoff — do not add server-side state.
 - ESLint + `npm run build` must pass at every commit; existing behavior (Bluesky/LinkedIn FormData path) must not regress.
 
@@ -32,16 +32,27 @@
 **Files:**
 - Modify: `package.json` (devDependencies + `test` script)
 - Create: `vitest.config.ts`
+- Create: `tests/setup.ts`
 - Create: `tests/ui/smoke.test.tsx`
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `npm test` runs vitest; `tests/server/**` runs in node environment, `tests/ui/**` in jsdom. Later tasks place tests at `tests/server/devto-validation.test.ts`, `tests/server/devto.test.ts`, `tests/ui/app-guard.test.tsx`.
+- Produces: `npm test` runs vitest; `tests/server/**` runs in node environment, `tests/ui/**` in jsdom. `tests/setup.ts` runs before EVERY test file: it deletes `DEVTO_API_KEY` / `DEVTO_API_KEY_TESSERA` (a developer's real `.env` keys must never enter the test process — `server/index.ts` imports `dotenv/config`) and points `DEVTO_API_BASE_OVERRIDE` at a closed local port, so an unstubbed devto test fails loudly instead of posting for real. Later tasks place tests at `tests/server/devto-validation.test.ts`, `tests/server/devto.test.ts`, `tests/ui/app-guard.test.tsx`.
 
 - [ ] **Step 1: Install dev tooling**
 
 ```bash
 npm install --save-dev vitest jsdom @testing-library/react @testing-library/user-event
+```
+
+- [ ] **Step 1b: Create `tests/setup.ts`**
+
+```ts
+// Fail loud, never post for real: no live dev.to keys in the test process, and any
+// unstubbed devto request hits a closed port instead of dev.to.
+delete process.env.DEVTO_API_KEY;
+delete process.env.DEVTO_API_KEY_TESSERA;
+process.env.DEVTO_API_BASE_OVERRIDE = "http://127.0.0.1:1"; // closed port
 ```
 
 - [ ] **Step 2: Create `vitest.config.ts`**
@@ -50,10 +61,9 @@ npm install --save-dev vitest jsdom @testing-library/react @testing-library/user
 import { defineConfig, mergeConfig } from "vitest/config";
 import viteConfig from "./vite.config";
 
-// Pin NODE_ENV UNCONDITIONALLY: the publisher's DEVTO_API_BASE_OVERRIDE gate checks
-// NODE_ENV === "test", and an exported NODE_ENV=production would otherwise send
-// publisher tests at the real dev.to host. This file is test-only infrastructure —
-// nothing here leaks into production.
+// Pin NODE_ENV for the createApp() listen-guard; the DEVTO_API_BASE_OVERRIDE gate
+// keys on VITEST instead (vitest sets it; production deployments do not). This file
+// is test-only infrastructure — nothing here leaks into production.
 process.env.NODE_ENV = "test";
 
 // vitest.config.ts REPLACES vite.config.ts (no merge): import and merge it so the
@@ -62,6 +72,7 @@ export default mergeConfig(
   viteConfig,
   defineConfig({
     test: {
+      setupFiles: ["./tests/setup.ts"],
       // environmentMatchGlobs is deprecated/removed in current vitest — use projects.
       projects: [
         {
@@ -746,11 +757,12 @@ describe("publishDevto", () => {
 
   it("never auto-retries on a 5xx unknown outcome", async () => {
     mode = "500";
-    const r = await publishDevto(ctx, "kurt");
+    const r = await publishDevto(ctx, "tessera");
     expect(requests).toBe(1); // exactly one outbound request
     expect(r.ok).toBe(false);
     expect(r.resultKind).toBe("unknown");
-    expect(r.message).toMatch(/check your dev\.to dashboard|api\/articles\/me/i);
+    expect(r.message).toMatch(/check this identity's dev\.to dashboard|api\/articles\/me/i);
+    expect(r.message).toMatch(/tessera/i); // identity in EVERY devto message (spec requirement)
   });
 
   it("times out after 30s max and reports an unknown outcome, once", async () => {
@@ -824,11 +836,11 @@ describe("publishDevto", () => {
 ```
 
 (Implementation note: `publishDevto` reads its base URL as `base()`, which honors
-`DEVTO_API_BASE_OVERRIDE` **only when `NODE_ENV === "test"`** — the override exists
-solely so tests hit a local stub with the real fetch path; production code never sets
-it, and a stray value outside tests is ignored so the `api-key` header can never be
-redirected to a foreign host. Do not introduce a fetch-mocking library — the spec's
-retry rule is about the real request lifecycle.)
+`DEVTO_API_BASE_OVERRIDE` **only when `process.env.VITEST` is set** (vitest sets it;
+production deployments do not — a stronger gate than NODE_ENV, which a deploy can set
+to "test"). The override exists solely so tests hit a local stub with the real fetch
+path; production code never sets it. Do not introduce a fetch-mocking library — the
+spec's retry rule is about the real request lifecycle.)
 
 - [ ] **Step 2: Run to verify failure** — Run: `npm test`. Expected: FAIL (module missing).
 
@@ -842,9 +854,10 @@ export const DEVTO_API_BASE = "https://dev.to/api";
 const TIMEOUT_MS = 30_000;
 
 function base(): string {
-  // Test-only override, gated so a stray env var in production can never redirect
-  // the api-key header to an attacker-chosen host.
-  if (process.env.NODE_ENV === "test" && process.env.DEVTO_API_BASE_OVERRIDE) {
+  // Test-only override, gated on VITEST (which vitest itself sets and production
+  // deployments do not — stronger than NODE_ENV, which a deploy can set to "test").
+  // A stray env var in production therefore cannot redirect the api-key header.
+  if (process.env.VITEST && process.env.DEVTO_API_BASE_OVERRIDE) {
     return process.env.DEVTO_API_BASE_OVERRIDE;
   }
   return DEVTO_API_BASE;
@@ -857,14 +870,16 @@ function errMsg(e: unknown, fallback: string): string {
   return fallback;
 }
 
-function unknownOutcome(reason: string): PublishResult {
+function unknownOutcome(identity: DevtoIdentity, reason: string): PublishResult {
   return {
     networkId: "devto",
     ok: false,
     resultKind: "unknown",
+    // The identity is in EVERY message (spec §per-network reporting): with two
+    // accounts, "check your dashboard" without a name invites checking the wrong one.
     message:
-      `${reason}. dev.to publishes are never auto-retried — the article may have been created. ` +
-      "Check your dev.to dashboard or GET /api/articles/me before re-posting.",
+      `dev.to (${identity}): ${reason}. dev.to publishes are never auto-retried — the article may have been created. ` +
+      "Check this identity's dev.to dashboard or GET /api/articles/me before re-posting.",
   };
 }
 
@@ -877,7 +892,7 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
       networkId,
       ok: false,
       resultKind: "rejected", // deterministic, nothing sent — UI auto-unlocks
-      message: `dev.to not configured for this identity: set ${envName} in .env`,
+      message: `dev.to (${identity}): not configured for this identity — set ${envName} in .env`,
     };
   }
   const article = ctx.article!;
@@ -908,15 +923,15 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
     // request was sent — and must map to the same unknown-outcome row, not reject.
     bodyText = await res.text();
   } catch (e: unknown) {
-    return unknownOutcome(errMsg(e, "Request to dev.to failed"));
+    return unknownOutcome(identity, errMsg(e, "Request to dev.to failed"));
   }
   if (res.status >= 500) {
-    return unknownOutcome(`dev.to returned ${res.status}`);
+    return unknownOutcome(identity, `dev.to returned ${res.status}`);
   }
   if (res.status === 429) {
     // A rate limit says nothing about whether an earlier request landed — same
     // unknown-outcome treatment as 5xx so the UI lock never auto-releases on it.
-    return unknownOutcome("dev.to rate-limited the request (429)");
+    return unknownOutcome(identity, "dev.to rate-limited the request (429)");
   }
   let parsed: { id?: number; url?: string; error?: string; status?: string } = {};
   try {
@@ -929,14 +944,14 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
       networkId,
       ok: false,
       resultKind: "rejected",
-      message: `dev.to rejected the article (${res.status}): ${parsed.error ?? bodyText.slice(0, 200)}`,
+      message: `dev.to (${identity}): rejected the article (${res.status}): ${parsed.error ?? bodyText.slice(0, 200)}`,
     };
   }
   if (parsed.id === undefined) {
     // A 2xx we cannot tie to an article id (captive-portal HTML, id-less success)
     // is an UNKNOWN outcome, never a success — reporting `created` here would
     // auto-unlock the UI duplicate guard on a possibly-double-posted article.
-    return unknownOutcome("dev.to returned an unparseable or id-less success response");
+    return unknownOutcome(identity, "dev.to returned an unparseable or id-less success response");
   }
   return {
     networkId,
@@ -1030,7 +1045,7 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
           networkId: "devto",
           ok: false,
           resultKind: "rejected" as const, // deterministic, nothing sent — UI auto-unlocks
-          message: `dev.to not configured for this identity: set ${envName} in .env`,
+          message: `dev.to (${identity ?? "unresolved"}): not configured for this identity — set ${envName} in .env`,
         }),
       });
     }
@@ -1047,8 +1062,11 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
       : {
           networkId: jobs[i].networkId,
           ok: false,
-          resultKind: "unknown" as const,
-          message: `Internal error: ${String(s.reason)}`,
+          // resultKind only on devto rows (only devto rows carry it); other
+          // networks' fallback rows leave it undefined — the UI's devto rules
+          // read devto rows only, and undefined is fail-closed for them anyway.
+          ...(jobs[i].networkId === "devto" ? { resultKind: "unknown" as const } : {}),
+          message: `Internal error (${jobs[i].networkId}): ${String(s.reason)}`,
         },
   );
 }
@@ -1330,10 +1348,10 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 **Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: text || undefined, bluesky, linkedin, devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })` — the other selected targets and `text` ride in the SAME JSON body, so a combined dev.to+Bluesky submit publishes both. When `devtoLocked` → the request is the **existing FormData path for the remaining targets only** — it never contains `devto`, `article`, or `devtoIdentity`, whatever the checkbox shows (locked dev.to cannot ride along on a Bluesky/LinkedIn submit). When devto is unchecked → the existing FormData path unchanged.
 
 **Lock rules (the heart of this task):**
-1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "pending:<identity>"` (e.g. `"pending:tessera"`) and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
+1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "pending:<identity>"` (e.g. `"pending:tessera"`); when no identity is configured/resolved, store `"pending:none"` — never `undefined` in the string. Set `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
 2. After the response: if the devto result row has `resultKind === "created"` or `"rejected"` → clear the flag, `devtoLocked = false`.
 3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row**, or the response body could not be parsed (e.g. a proxy HTML page — an unparseable 2xx is an unknown outcome, never a success) → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row. Never clear the lock in a `finally` — only the outcome rules above may. **Fail-closed default:** ONLY an explicit `created`, an explicit `rejected`, or a 4xx-without-devto-row unlocks. A missing or unrecognized `resultKind` keeps the lock.
-4. The confirmation checkbox label NAMES THE ACCOUNT: `I checked <Identity>'s dev.to account — no duplicate article` (identity read from the stored flag, e.g. `pending:tessera` → "I checked Tessera's dev.to account…"). A generic "I checked dev.to" is not enough — an unknown outcome on a Tessera submit must not be cleared by checking Kurt's dashboard. The checkbox is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
+4. The confirmation checkbox label NAMES THE ACCOUNT: `I checked <Identity>'s dev.to account — no duplicate article` (identity read from the stored flag, e.g. `pending:tessera` → "I checked Tessera's dev.to account…"; `pending:none` → "I checked the dev.to account — no duplicate article"). A generic "I checked dev.to" is not enough — an unknown outcome on a Tessera submit must not be cleared by checking Kurt's dashboard. The checkbox is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
 5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` and the confirmation checkbox renders (rule 4, with the stored identity in the label) — a reloaded tab always has an exit hatch; the only way to be stuck is to never confirm.
 6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets. The **image picker re-enables while locked** (the locked dev.to cannot go out, so an image for Bluesky/LinkedIn is legitimate): the picker is disabled iff dev.to is targeted AND not locked — `disabled={devto && !devtoLocked}`. **Reset while locked:** clears text/article fields, file, and results, but the dev.to checkbox stays checked+disabled and the flag/confirmation requirement is untouched — Reset can never end a lock.
 7. Double-click guard: the submit handler checks the `submitting` ref synchronously and returns if it is already set (state updates are async; the ref is not), sets it before any fetch, and clears it in a `finally`. The Publish button is disabled while `submitting`. A double-click can therefore never send two devto requests in one session.
