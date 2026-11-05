@@ -20,7 +20,7 @@
 - Env vars: `DEVTO_API_KEY` (Kurt), `DEVTO_API_KEY_TESSERA` (optional). Keys never transit the client or chat.
 - Tessera-authored posts: the server 400s when `devtoIdentity` is `"tessera"` and `bodyMarkdown` lacks the disclosure line — case-insensitive, whitespace-normalised substring match. Disclosure line (exact string): `Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.`
 - `/api/publish` request rules: `text` required only when Bluesky or LinkedIn targeted; `devto: true` without `article` → 400; `article` without `devto: true` → 400; article fields + image → 400 (and the UI disables the image picker so users never hit it); at-least-one-destination check includes `devto`.
-- JSON body limit: `2mb` (Express default 100kb would 413 a ≤400k-char non-ASCII `bodyMarkdown`). multer keeps handling multipart; `express.json()` handles JSON.
+- JSON body limit: `3mb` (Express default 100kb would 413 a long `bodyMarkdown`; 400k chars of worst-case `\u00XX`-escaped non-ASCII is ~2.4 MB, so 3mb leaves headroom). multer keeps handling multipart; `express.json()` handles JSON. The route's error middleware must pass through `express.json()`'s own 4xx statuses (400 malformed JSON, 413 over-limit) instead of rewriting them to 500 — the UI's unlock rule depends on deterministic 4xx being distinguishable from 5xx.
 - `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx or a nothing-sent failure (auto-unlocks the UI lock), `unknown` = timeout/5xx/transport (keeps it locked until the "checked dev.to" confirmation). Only devto rows carry it (`devto.ts` and the registry's unconfigured-key row); other publishers leave it undefined.
 - Duplicate-article defence is client-side by design (stateless app): sessionStorage-backed submit-time lock, per-browser-tab; closing the tab clears it. Accepted v1 tradeoff — do not add server-side state.
 - ESLint + `npm run build` must pass at every commit; existing behavior (Bluesky/LinkedIn FormData path) must not regress.
@@ -48,6 +48,11 @@ npm install --save-dev vitest jsdom @testing-library/react @testing-library/user
 
 ```ts
 import { defineConfig } from "vitest/config";
+
+// Pin NODE_ENV: the publisher's DEVTO_API_BASE_OVERRIDE gate checks NODE_ENV === "test",
+// and vitest only defaults NODE_ENV when it is unset — an exported NODE_ENV=production
+// would send publisher tests at the real dev.to host.
+process.env.NODE_ENV ??= "test";
 
 export default defineConfig({
   test: {
@@ -977,7 +982,7 @@ return settled.map((s, i) =>
 ```ts
 export function createApp(): Express {
   const app = express();
-  app.use(express.json({ limit: "2mb" })); // default 100kb would 413 a <=400k-char bodyMarkdown
+  app.use(express.json({ limit: "3mb" })); // default 100kb would 413; 400k worst-case-escaped chars ≈ 2.4MB, 3mb leaves headroom
   // ...upload, /api/publish, /api/health, static fallback, error middleware...
   return app;
 }
@@ -1000,7 +1005,10 @@ app.post("/api/publish", upload.single("image"), async (req: Request, res: Respo
       linkedin: parseFlag(body.linkedin),
       devto: parseFlag(body.devto),
     };
-    const devtoIdentity = typeof body.devtoIdentity === "string" ? body.devtoIdentity : undefined;
+    // Pass through UNCHANGED: a non-string devtoIdentity (42, ["tessera"], {}) must hit
+    // the validator's unknown-identity 400, never silently default to Kurt — the
+    // fail-open coercion would skip the Tessera disclosure guard.
+    const devtoIdentity: unknown = body.devtoIdentity;
     const article = body.article;
     const file = req.file;
     const hasImage = Boolean(file && file.buffer.length);
@@ -1024,6 +1032,32 @@ app.post("/api/publish", upload.single("image"), async (req: Request, res: Respo
 });
 ```
 
+  - The error middleware hardening (Task 6 must not skip this — `express.json()` rejects malformed JSON with a 400 and over-limit bodies with a 413, and both MUST keep their status so the UI's deterministic-4xx unlock rule works):
+
+```ts
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      res.status(400).json({ error: `Image too large (max ${MAX_IMAGE_BYTES} bytes)` });
+      return;
+    }
+  }
+  if (err instanceof Error && err.message.startsWith("Unsupported image")) {
+    res.status(400).json({ error: err.message });
+    return;
+  }
+  // body-parser errors carry status/statusCode (400 malformed JSON, 413 over limit):
+  const e = err as { status?: unknown; statusCode?: unknown; message?: unknown };
+  const status = typeof e?.status === "number" ? e.status : typeof e?.statusCode === "number" ? e.statusCode : undefined;
+  if (status !== undefined && status >= 400 && status < 500) {
+    res.status(status).json({ error: typeof e.message === "string" ? e.message : "Request error" });
+    return;
+  }
+  const msg = err instanceof Error ? err.message : "Server error";
+  res.status(500).json({ error: msg });
+});
+```
+
   - Extend `/api/health`:
 
 ```ts
@@ -1040,12 +1074,11 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createApp } from "../../server/index.js";
 
-// Deterministic bluesky rejection via module mock — no env-var roulette: the real
-// isBlueskyConfigured may treat an empty handle as configured, so forcing failure
-// through env values alone is not reliable.
+// Deterministic bluesky failure via module mock — and it REJECTS (throws), not
+// resolves-false, so Promise.allSettled's rejected branch is actually exercised.
 vi.mock("../../server/publishers/bluesky.js", () => ({
   isBlueskyConfigured: () => true,
-  publishBluesky: async () => ({ networkId: "bluesky", ok: false, message: "stubbed bluesky failure" }),
+  publishBluesky: async () => { throw new Error("boom"); },
 }));
 
 let appUrl = "";
@@ -1117,6 +1150,36 @@ describe("POST /api/publish (real app)", () => {
     expect(json.error).toMatch(/dev\.to requires an article/);
   });
 
+  it("400s on a non-string devtoIdentity instead of defaulting to Kurt", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true, devtoIdentity: 42, article }),
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json() as { error: string };
+    expect(json.error).toMatch(/Unknown dev\.to identity/);
+    expect(forseen.apiKey).toBeUndefined(); // nothing reached dev.to
+  });
+
+  it("keeps 400 for malformed JSON (no 500 rewrite)", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("keeps 413 for an over-limit body (no 500 rewrite)", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true, article: { title: "T", bodyMarkdown: "x" , pad: "y".repeat(3_200_000) } }),
+    });
+    expect(res.status).toBe(413);
+  });
+
   it("returns per-network rows even when a publisher rejects", async () => {
     const res = await fetch(`${appUrl}/api/publish`, {
       method: "POST",
@@ -1125,8 +1188,9 @@ describe("POST /api/publish (real app)", () => {
     });
     const json = await res.json() as { results: Array<{ networkId: string; ok: boolean }> };
     const rows = json.results.map((r) => r.networkId).sort();
-    expect(rows).toEqual(["bluesky", "devto"]); // both rows present despite the bluesky failure
+    expect(rows).toEqual(["bluesky", "devto"]); // both rows present despite the bluesky THROW
     expect(json.results.find((r) => r.networkId === "bluesky")?.ok).toBe(false);
+    expect(json.results.find((r) => r.networkId === "devto")?.ok).toBe(true); // devto row survived the rejection
   });
 
   it("health exposes the configured identity list", async () => {
@@ -1170,7 +1234,7 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 **Lock rules (the heart of this task):**
 1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "1"` and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
 2. After the response: if the devto result row has `resultKind === "created"` or `"rejected"` → clear the flag, `devtoLocked = false`.
-3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row** → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row.
+3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row**, or the response body could not be parsed (e.g. a proxy HTML page — an unparseable 2xx is an unknown outcome, never a success) → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row. Never clear the lock in a `finally` — only the outcome rules above may.
 4. The confirmation checkbox (label: `I checked dev.to — no duplicate article`) is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
 5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` and the confirmation checkbox renders (rule 4) — a reloaded tab always has an exit hatch; the only way to be stuck is to never confirm.
 6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets.
@@ -1363,32 +1427,48 @@ git commit -m "chore: track scripts/validate-bluesky.mjs (spec mirror target, ve
 - [ ] **Step 2: Write `scripts/validate-devto.mjs`** (mirrors the bluesky script's shape: read-only, never prints the key):
 
 ```js
-// Read-only dev.to credential check: GET /api/articles/me with the key, print the
-// account name, immediately done. Never prints the API key.
-// Usage: DEVTO_API_KEY=... node scripts/validate-devto.mjs   (or DEVTO_API_KEY_TESSERA)
+// Read-only dev.to credential check: GET /api/articles/me with each CONFIGURED key,
+// print the per-identity result, never print a key.
+// Usage: node scripts/validate-devto.mjs [kurt|tessera]   (identity arg optional;
+// without it, every identity whose env var is set gets checked)
 import "dotenv/config";
 
-const key = process.env.DEVTO_API_KEY ?? process.env.DEVTO_API_KEY_TESSERA;
-const which = process.env.DEVTO_API_KEY ? "DEVTO_API_KEY" : process.env.DEVTO_API_KEY_TESSERA ? "DEVTO_API_KEY_TESSERA" : null;
-if (!key) {
-  console.error("MISSING: DEVTO_API_KEY / DEVTO_API_KEY_TESSERA not set");
+const keys = {
+  kurt: process.env.DEVTO_API_KEY,
+  tessera: process.env.DEVTO_API_KEY_TESSERA,
+};
+const only = process.argv[2];
+if (only && !(only in keys)) {
+  console.error(`Unknown identity: ${only} (use kurt or tessera)`);
   process.exit(2);
 }
-try {
-  const res = await fetch("https://dev.to/api/articles/me", {
-    headers: { "api-key": key },
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) {
-    console.log(JSON.stringify({ ok: false, status: res.status, identity: which }));
-    process.exit(1);
-  }
-  const articles = await res.json();
-  console.log(JSON.stringify({ ok: true, identity: which, articleCount: Array.isArray(articles) ? articles.length : null }));
-} catch (e) {
-  console.log(JSON.stringify({ ok: false, error: String(e?.message ?? e), identity: which }));
-  process.exit(1);
+
+const targets = Object.entries(keys).filter(([id, key]) => key && (only ? id === only : true));
+if (targets.length === 0) {
+  console.error("MISSING: DEVTO_API_KEY / DEVTO_API_KEY_TESSERA not set (for the requested identity)");
+  process.exit(2);
 }
+
+let failed = false;
+for (const [identity, key] of targets) {
+  try {
+    const res = await fetch("https://dev.to/api/articles/me", {
+      headers: { "api-key": key },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) {
+      console.log(JSON.stringify({ ok: false, status: res.status, identity }));
+      failed = true;
+      continue;
+    }
+    const articles = await res.json();
+    console.log(JSON.stringify({ ok: true, identity, articleCount: Array.isArray(articles) ? articles.length : null }));
+  } catch (e) {
+    console.log(JSON.stringify({ ok: false, error: String(e?.message ?? e), identity }));
+    failed = true;
+  }
+}
+process.exit(failed ? 1 : 0);
 ```
 
 - [ ] **Step 3: `.env.example`** — append (with the two identities commented as optional in the doc sense; the keys themselves stay blank):

@@ -1,7 +1,8 @@
 # dev.to as a third crosspost target (Tessera + Kurt)
 
 **Date:** 2026-11-03
-**Status:** Draft — awaiting Kurt's spec approval
+**Status:** Reviewed — approved by Kurt 2026-11-04 ~11 PM EST (chat ruling, delivery thread;
+spec review ladder converged 2026-11-04, ALL FINDINGS RESOLVED, ~$1.55 of the $3.25 ceiling)
 **Requested by:** Kurt VanDusen, 2026-11-03: Medium is out (platform policy); use
 crosspost-publish to post to dev.to "for you [Tessera] to post more widely, as well as
 I will use it for my posts."
