@@ -20,7 +20,7 @@
 - Env vars: `DEVTO_API_KEY` (Kurt), `DEVTO_API_KEY_TESSERA` (optional). Keys never transit the client or chat.
 - Tessera-authored posts: the server 400s when `devtoIdentity` is `"tessera"` and `bodyMarkdown` lacks the disclosure line — case-insensitive, whitespace-normalised substring match. Disclosure line (exact string): `Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.`
 - `/api/publish` request rules: `text` required only when Bluesky or LinkedIn targeted; `devto: true` without `article` → 400; `article` without `devto: true` → 400; article fields + image → 400 (and the UI disables the image picker so users never hit it); at-least-one-destination check includes `devto`.
-- JSON body limit: `2mb` (per the approved spec — DO NOT raise it): `JSON.stringify` emits non-ASCII characters raw (UTF-8), so the UI's worst case is ~1.2 MB for 400k CJK-range chars — comfortably under 2 MiB. multer keeps handling multipart; `express.json()` handles JSON. The route's error middleware must pass through `express.json()`'s own 4xx statuses (400 malformed JSON, 413 over-limit) instead of rewriting them to 500 — the UI's unlock rule depends on deterministic 4xx being distinguishable from 5xx, and 413 passthrough keeps an over-limit submit deterministic even though the real UI never hits it.
+- JSON body limit: `2mb` (per the approved spec — DO NOT raise it): `JSON.stringify` emits non-ASCII characters raw (UTF-8), so normal text peaks at ~1.2 MB for 400k CJK-range chars. Pathological control-character/lone-surrogate content escapes to ~2.4 MB and hits the 413 — acceptable: the 413 is a deterministic 4xx, the lock logic stays safe, and `validateArticle` length limits plus the UI maxlength keep real content far below the line. multer keeps handling multipart; `express.json()` handles JSON. The route's error middleware must pass through `express.json()`'s own 4xx statuses (400 malformed JSON, 413 over-limit) instead of rewriting them to 500 — the UI's unlock rule depends on deterministic 4xx being distinguishable from 5xx.
 - `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx or a nothing-sent failure (auto-unlocks the UI lock), `unknown` = timeout/5xx/transport (keeps it locked until the "checked dev.to" confirmation). Only devto rows carry it (`devto.ts` and the registry's unconfigured-key row); other publishers leave it undefined.
 - Duplicate-article defence is client-side by design (stateless app): sessionStorage-backed submit-time lock, per-browser-tab; closing the tab clears it. Accepted v1 tradeoff — do not add server-side state.
 - ESLint + `npm run build` must pass at every commit; existing behavior (Bluesky/LinkedIn FormData path) must not regress.
@@ -138,7 +138,11 @@ export type DevtoArticle = {
 };
 // PublishContext gains: article?: DevtoArticle
 // PublishResult gains: url?: string; resultKind?: "created" | "rejected" | "unknown"
-// PublishTargets gains: devto: boolean; devtoIdentity?: DevtoIdentity
+// PublishTargets gains: devto?: boolean; devtoIdentity?: DevtoIdentity
+//   (devto is OPTIONAL: making it required in this same commit breaks tsc — the
+//   current route builds targets without it and passes them to publishAll, so the
+//   "green at every commit" constraint fails at Task 2. The route sets it from
+//   parseFlag in Task 6; the registry branch reads it truthily.)
 
 // devto-validation.ts exports
 export const DISCLOSURE_LINE: string;
@@ -454,6 +458,7 @@ describe("identity resolution", () => {
 });
 
 describe("validatePublishRequest", () => {
+  afterEach(() => vi.unstubAllEnvs()); // "defaults an omitted identity" stubs DEVTO_API_KEY — keep it from leaking
   const both = { bluesky: true, linkedin: true, devto: false };
 
   it("requires text when Bluesky or LinkedIn is targeted", () => {
@@ -1016,7 +1021,7 @@ return settled.map((s, i) =>
 ```ts
 export function createApp(): Express {
   const app = express();
-  app.use(express.json({ limit: "2mb" })); // spec limit; JSON.stringify worst case ~1.2MB — 2MiB has headroom
+  app.use(express.json({ limit: "2mb" })); // spec limit; normal text worst case ~1.2MB. Adversarial control-char/lone-surrogate content can serialize to ~2.4MB → 413, which is a deterministic 4xx and keeps the lock logic safe. Do not raise the limit (spec).
   // ...upload, /api/publish, /api/health, static fallback, error middleware...
   return app;
 }
@@ -1105,7 +1110,7 @@ app.get("/api/health", (_req, res) => {
 - [ ] **Step 3: Route tests against the REAL app** — `tests/server/publish-route.test.ts` boots `createApp()` on port 0 and speaks HTTP, with the Forem stub from `devto.test.ts` behind `DEVTO_API_BASE_OVERRIDE`. This is the test that would have caught the identity-dropping bug:
 
 ```ts
-import { describe, it, expect, afterAll, beforeAll, vi } from "vitest";
+import { describe, it, expect, afterAll, beforeAll, beforeEach, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createApp } from "../../server/index.js";
@@ -1202,6 +1207,17 @@ describe("POST /api/publish (real app)", () => {
     expect(forseen.apiKey).toBeUndefined(); // nothing reached dev.to
   });
 
+  it("400s on devtoIdentity null (the UI must omit the key, never send null)", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true, devtoIdentity: null, article }),
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json() as { error: string };
+    expect(json.error).toMatch(/Unknown dev\.to identity/);
+  });
+
   it("keeps 400 for malformed JSON (no 500 rewrite)", async () => {
     const res = await fetch(`${appUrl}/api/publish`, {
       method: "POST",
@@ -1267,6 +1283,8 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 
 **State additions:** `devto: boolean`, `devtoIdentity: string | null`, `title`, `bodyMarkdown`, `canonicalUrl`, `description`, `tags` (comma-separated string), `identities: string[]` (from health), `devtoLocked: boolean`, `devtoCheckConfirmed: boolean`.
 
+**Identity state discipline (Kurt-only config is day-one):** when the health response arrives, if `devtoIdentity` is still `null` and `identities.length > 0` → set it to `identities[0]` (Kurt in the single-key setup). In the submit path, if `devtoIdentity` is still `null` at submit time, **omit the key entirely** — the server then defaults to the first configured identity. Never serialize `"devtoIdentity": null`: the validator's unknown-identity check would 400 every dev.to submit in exactly the one-key configuration most users start with.
+
 **sessionStorage key:** `crosspost.devtoPending` (value `"1"`).
 
 **Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: text || undefined, bluesky, linkedin, devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })` — the other selected targets and `text` ride in the SAME JSON body, so a combined dev.to+Bluesky submit publishes both. When `devtoLocked` → the request is the **existing FormData path for the remaining targets only** — it never contains `devto`, `article`, or `devtoIdentity`, whatever the checkbox shows (locked dev.to cannot ride along on a Bluesky/LinkedIn submit). When devto is unchecked → the existing FormData path unchanged.
@@ -1277,7 +1295,7 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row**, or the response body could not be parsed (e.g. a proxy HTML page — an unparseable 2xx is an unknown outcome, never a success) → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row. Never clear the lock in a `finally` — only the outcome rules above may.
 4. The confirmation checkbox (label: `I checked dev.to — no duplicate article`) is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
 5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` and the confirmation checkbox renders (rule 4) — a reloaded tab always has an exit hatch; the only way to be stuck is to never confirm.
-6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets.
+6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets. The **image picker re-enables while locked** (the locked dev.to cannot go out, so an image for Bluesky/LinkedIn is legitimate): the picker is disabled iff dev.to is targeted AND not locked — `disabled={devto && !devtoLocked}`. **Reset while locked:** clears text/article fields, file, and results, but the dev.to checkbox stays checked+disabled and the flag/confirmation requirement is untouched — Reset can never end a lock.
 7. Double-click guard: the submit handler checks the `submitting` ref synchronously and returns if it is already set (state updates are async; the ref is not), sets it before any fetch, and clears it in a `finally`. The Publish button is disabled while `submitting`. A double-click can therefore never send two devto requests in one session.
 
 - [ ] **Step 1: Write the failing UI-guard test** — `tests/ui/app-guard.test.tsx` (stub `fetch` with `vi.stubGlobal`; the health call returns `{ ok: true, devtoIdentities: ["kurt", "tessera"] }`):
@@ -1373,6 +1391,36 @@ describe("dev.to submit-time lock", () => {
     expect(parsed.bluesky).toBe(true);
     expect(parsed.text).toBe("short post");
     expect(parsed.article.title).toBe("T");
+  });
+
+  it("a Kurt-only submit (single configured identity) works without a manual selector", async () => {
+    const f = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt"] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: true, resultKind: "created", url: "https://dev.to/x" }] }) });
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    await fillArticleForm();
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    await screen.findByText("https://dev.to/x");
+    const parsed = JSON.parse((f.mock.calls[1]?.[1] as RequestInit).body as string) as { devtoIdentity?: string | null };
+    // never serialize null: null would 400 the day-one single-key configuration
+    expect(parsed.devtoIdentity === undefined || parsed.devtoIdentity === "kurt").toBe(true);
+    expect(screen.queryByLabelText(/publish as/i)).toBeNull(); // selector hidden for a single identity
+  });
+
+  it("re-enables the image picker while dev.to is locked (Bluesky/LinkedIn keep images)", async () => {
+    const f = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt", "tessera"] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: false, resultKind: "unknown", message: "may exist" }] }) });
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    await fillArticleForm();
+    expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(true); // targeted, not locked
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
+    expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(false); // locked → dev.to cannot go out → image usable
   });
 
   it("shows the identity selector when more than one identity is configured", async () => {
