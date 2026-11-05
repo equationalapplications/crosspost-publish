@@ -1,9 +1,12 @@
 import "dotenv/config";
-import express, { type Request, type Response, type NextFunction } from "express";
+import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import multer from "multer";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { publishAll } from "./publishers/registry.js";
+import { validatePublishRequest, devtoIdentities } from "./publishers/devto-validation.js";
+import rateLimit from "express-rate-limit";
+import type { PublishTargets } from "./publishers/types.js";
 
 const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? 3001);
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
@@ -21,77 +24,124 @@ const upload = multer({
   },
 });
 
-const app = express();
-
 function parseFlag(v: unknown): boolean {
   return v === "1" || v === "true" || v === "on" || v === true;
 }
 
-app.post("/api/publish", upload.single("image"), async (req: Request, res: Response) => {
-  try {
-    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
-    if (!text) {
-      res.status(400).json({ error: "text is required" });
-      return;
-    }
+export function createApp(): Express {
+  const app = express();
+  app.use(express.json({ limit: "2mb" })); // spec limit; normal text worst case ~1.2MB. Adversarial control-char/lone-surrogate content can serialize to ~2.4MB → 413, which is a deterministic 4xx and keeps the lock logic safe. Do not raise the limit (spec).
 
-    const targets = {
-      bluesky: parseFlag(req.body?.bluesky),
-      linkedin: parseFlag(req.body?.linkedin),
-    };
-    if (!targets.bluesky && !targets.linkedin) {
-      res.status(400).json({ error: "Select at least one destination" });
-      return;
-    }
-
-    const file = req.file;
-    const ctx = {
-      text,
-      image:
-        file && file.buffer.length
-          ? { buffer: file.buffer, mimeType: file.mimetype }
-          : undefined,
-    };
-
-    const results = await publishAll(ctx, targets);
-    res.json({ results });
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Publish failed";
-    res.status(500).json({ error: msg });
-  }
-});
-
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
-const clientDist = join(process.cwd(), "dist", "client");
-if (existsSync(join(clientDist, "index.html"))) {
-  app.use(express.static(clientDist));
-  app.use((req: Request, res: Response) => {
-    if (req.path.startsWith("/api")) {
-      res.status(404).json({ error: "Not found" });
-      return;
-    }
-    res.sendFile(join(clientDist, "index.html"));
+  // Rate limit publishes: this server automates real cross-posts, so a runaway local
+  // loop hammering /api/publish would spam the actual Bluesky/LinkedIn/dev.to accounts.
+  // 20/min is far above any interactive use.
+  // Scoped to the POST route (not app.use): non-POST requests to this path 404 and
+  // must not consume rate-limit tokens, or trivial cross-method noise could exhaust
+  // the limit and lock out legitimate publishes.
+  const publishLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 20,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: "Too many publish requests — wait a minute and retry" },
   });
+
+  app.post("/api/publish", publishLimiter, upload.single("image"), async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      // Annotated PublishTargets: the devtoIdentity assignment below is a type error
+      // on an inferred literal type (TS2339) — the annotation is required for tsc.
+      const targets: PublishTargets = {
+        bluesky: parseFlag(body.bluesky),
+        linkedin: parseFlag(body.linkedin),
+        devto: parseFlag(body.devto),
+      };
+      // Pass through UNCHANGED: a non-string devtoIdentity (42, ["tessera"], {}) must hit
+      // the validator's unknown-identity 400, never silently default to Kurt — the
+      // fail-open coercion would skip the Tessera disclosure guard.
+      const devtoIdentity: unknown = body.devtoIdentity;
+      const article = body.article;
+      const file = req.file;
+      const hasImage = Boolean(file && file.buffer.length);
+      const rules = validatePublishRequest({ text: body.text, targets: { bluesky: targets.bluesky, linkedin: targets.linkedin, devto: targets.devto === true }, article, devtoIdentity, hasImage });
+      if (!rules.ok) {
+        res.status(rules.status).json({ error: rules.error });
+        return;
+      }
+      if (targets.devto) targets.devtoIdentity = rules.identity;
+      const ctx = {
+        text: rules.text,
+        article: rules.article,
+        image: hasImage && file ? { buffer: file.buffer, mimeType: file.mimetype } : undefined,
+      };
+      const results = await publishAll(ctx, targets);
+      res.json({ results });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Publish failed";
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, devtoIdentities: devtoIdentities() });
+  });
+
+  const clientDist = join(process.cwd(), "dist", "client");
+  if (existsSync(join(clientDist, "index.html"))) {
+    app.use(express.static(clientDist));
+    // SPA fallback: sendFile is a file-system access, so CodeQL's
+    // js/missing-rate-limiting requires rate limiting in this handler's chain.
+    // Static assets above go through express.static (not flagged); the fallback
+    // only fires for client-side deep links, where 300/min per IP is far above
+    // any real browser session.
+    const staticLimiter = rateLimit({
+      windowMs: 60_000,
+      limit: 300,
+      standardHeaders: "draft-7",
+      legacyHeaders: false,
+    });
+    app.use(staticLimiter, (req: Request, res: Response) => {
+      if (req.path.startsWith("/api")) {
+        res.status(404).json({ error: "Not found" });
+        return;
+      }
+      res.sendFile(join(clientDist, "index.html"));
+    });
+  }
+
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        res.status(400).json({ error: `Image too large (max ${MAX_IMAGE_BYTES} bytes)` });
+        return;
+      }
+    }
+    if (err instanceof Error && err.message.startsWith("Unsupported image")) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    // body-parser errors carry status/statusCode (400 malformed JSON, 413 over limit):
+    const e = err as { status?: unknown; statusCode?: unknown; message?: unknown };
+    const status = typeof e?.status === "number" ? e.status : typeof e?.statusCode === "number" ? e.statusCode : undefined;
+    if (status !== undefined && status >= 400 && status < 500) {
+      res.status(status).json({ error: typeof e.message === "string" ? e.message : "Request error" });
+      return;
+    }
+    const msg = err instanceof Error ? err.message : "Server error";
+    res.status(500).json({ error: msg });
+  });
+
+  return app;
 }
 
-app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      res.status(400).json({ error: `Image too large (max ${MAX_IMAGE_BYTES} bytes)` });
-      return;
-    }
-  }
-  if (err instanceof Error && err.message.startsWith("Unsupported image")) {
-    res.status(400).json({ error: err.message });
-    return;
-  }
-  const msg = err instanceof Error ? err.message : "Server error";
-  res.status(500).json({ error: msg });
-});
-
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`API listening on http://127.0.0.1:${PORT}`);
-});
+// createApp() is import-safe under vitest because the listen call is gated on
+// process.env.VITEST (vitest sets it; a production deploy never does — unlike
+// NODE_ENV, which a deploy could set to "test" and silently produce a
+// no-listener process, hence the explicit "not listening" log).
+if (process.env.VITEST) {
+  console.log("not listening (test mode)");
+} else {
+  createApp().listen(PORT, "127.0.0.1", () => {
+    console.log(`API listening on http://127.0.0.1:${PORT}`);
+  });
+}
