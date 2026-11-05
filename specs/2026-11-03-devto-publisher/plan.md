@@ -50,9 +50,28 @@ npm install --save-dev vitest jsdom @testing-library/react @testing-library/user
 ```ts
 // Fail loud, never post for real: no live dev.to keys in the test process, and any
 // unstubbed devto request hits a closed port instead of dev.to.
+// DOTENV_CONFIG_PATH first: server/index.ts imports "dotenv/config", which would
+// otherwise REFILL the keys we delete here from the developer's real .env
+// (dotenv reads this variable in env-options.js — verified 2026-11-04).
+process.env.DOTENV_CONFIG_PATH = "./tests/no-dotenv-here"; // nonexistent path
 delete process.env.DEVTO_API_KEY;
 delete process.env.DEVTO_API_KEY_TESSERA;
 process.env.DEVTO_API_BASE_OVERRIDE = "http://127.0.0.1:1"; // closed port
+```
+
+- [ ] **Step 1c: Create `tests/server/setup-guard.test.ts`** — a permanent meta-test so the guard cannot fail silently (if `setupFiles`/`extends` propagation ever breaks, THIS fails, not a live post):
+
+```ts
+import { describe, it, expect } from "vitest";
+
+describe("test-environment guard", () => {
+  it("has live keys scrubbed and the dev.to override on a closed port", () => {
+    expect(process.env.DEVTO_API_KEY).toBeUndefined();
+    expect(process.env.DEVTO_API_KEY_TESSERA).toBeUndefined();
+    expect(process.env.DEVTO_API_BASE_OVERRIDE).toBe("http://127.0.0.1:1");
+    expect(process.env.DOTENV_CONFIG_PATH).toBe("./tests/no-dotenv-here");
+  });
+});
 ```
 
 - [ ] **Step 2: Create `vitest.config.ts`**
@@ -74,8 +93,12 @@ export default mergeConfig(
     test: {
       setupFiles: ["./tests/setup.ts"],
       // environmentMatchGlobs is deprecated/removed in current vitest — use projects.
+      // extends: true on BOTH projects: inline projects do NOT inherit root test
+      // options (setupFiles!) without it — without this the setup guard silently
+      // never runs.
       projects: [
         {
+          extends: true,
           test: {
             name: "server",
             environment: "node",
@@ -83,6 +106,7 @@ export default mergeConfig(
           },
         },
         {
+          extends: true,
           test: {
             name: "ui",
             environment: "jsdom",
@@ -1181,11 +1205,11 @@ vi.mock("../../server/publishers/bluesky.js", () => ({
 }));
 
 let appUrl = "";
-let forseen: { apiKey?: string; body?: string } = {};
+let foreseen: { apiKey?: string; body?: string } = {};
 
 const forem: Server = createServer((req, res) => {
-  forseen = { apiKey: req.headers["api-key"] as string | undefined, body: "" };
-  req.on("data", (c: Buffer) => { forseen.body += c.toString(); });
+  foreseen = { apiKey: req.headers["api-key"] as string | undefined, body: "" };
+  req.on("data", (c: Buffer) => { foreseen.body += c.toString(); });
   req.on("end", () => {
     res.writeHead(201, { "content-type": "application/json" });
     res.end(JSON.stringify({ id: 42, url: "https://dev.to/t/article" }));
@@ -1207,7 +1231,7 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  forseen = {}; // module-level stub state must not leak between tests
+  foreseen = {}; // module-level stub state must not leak between tests
 });
 
 afterAll(() => {
@@ -1229,7 +1253,7 @@ describe("POST /api/publish (real app)", () => {
     });
     const json = await res.json() as { results: Array<{ networkId: string; ok: boolean }> };
     expect(json.results.find((r) => r.networkId === "devto")?.ok).toBe(true);
-    expect(forseen.apiKey).toBe("tessera-route-key"); // NOT kurt-route-key
+    expect(foreseen.apiKey).toBe("tessera-route-key"); // NOT kurt-route-key
   });
 
   it("defaults an omitted identity to Kurt", async () => {
@@ -1239,7 +1263,7 @@ describe("POST /api/publish (real app)", () => {
       body: JSON.stringify({ devto: true, article }),
     });
     await res.json();
-    expect(forseen.apiKey).toBe("kurt-route-key");
+    expect(foreseen.apiKey).toBe("kurt-route-key");
   });
 
   it("400s on a rule violation without touching dev.to", async () => {
@@ -1262,7 +1286,7 @@ describe("POST /api/publish (real app)", () => {
     expect(res.status).toBe(400);
     const json = await res.json() as { error: string };
     expect(json.error).toMatch(/Unknown dev\.to identity/);
-    expect(forseen.apiKey).toBeUndefined(); // nothing reached dev.to
+    expect(foreseen.apiKey).toBeUndefined(); // nothing reached dev.to
   });
 
   it("400s on devtoIdentity null (the UI must omit the key, never send null)", async () => {
