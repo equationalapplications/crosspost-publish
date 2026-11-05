@@ -1,4 +1,4 @@
-import type { DevtoArticle } from "./types.js";
+import type { DevtoArticle, DevtoIdentity } from "./types.js";
 
 export const DISCLOSURE_LINE =
   "Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.";
@@ -60,4 +60,79 @@ export function normalizeForMatch(s: string): string {
   // \u2019 (curly right single quote) → straight apostrophe: rich-text editors emit
   // curly quotes and a compliant Tessera post must not 400 on paste.
   return s.toLowerCase().replace(/[\u2018\u2019\u02BC]/g, "'").replace(/\s+/g, " ").trim();
+}
+
+const IDENTITY_ENV: Record<DevtoIdentity, string> = {
+  kurt: "DEVTO_API_KEY",
+  tessera: "DEVTO_API_KEY_TESSERA",
+};
+
+export function isDevtoKeyConfigured(identity: DevtoIdentity): boolean {
+  return Boolean(process.env[IDENTITY_ENV[identity]]);
+}
+
+export function resolveDevtoIdentityKey(identity: DevtoIdentity): string | undefined {
+  // An empty env value counts as unconfigured, matching isDevtoKeyConfigured.
+  const key = process.env[IDENTITY_ENV[identity]];
+  return key ? key : undefined;
+}
+
+export function devtoIdentities(): DevtoIdentity[] {
+  return (["kurt", "tessera"] as DevtoIdentity[]).filter((id) => isDevtoKeyConfigured(id));
+}
+
+function isDevtoIdentity(v: unknown): v is DevtoIdentity {
+  return v === "kurt" || v === "tessera";
+}
+
+export type PublishRequestRulesInput = {
+  text?: unknown;
+  targets: { bluesky: boolean; linkedin: boolean; devto: boolean };
+  article?: DevtoArticle | unknown;
+  devtoIdentity?: unknown;
+  hasImage: boolean;
+};
+
+export type PublishRequestRulesResult =
+  | { ok: true; text: string; article?: DevtoArticle; identity?: DevtoIdentity }
+  | { ok: false; status: 400; error: string };
+
+export function validatePublishRequest(
+  input: PublishRequestRulesInput,
+): PublishRequestRulesResult {
+  const { targets, hasImage } = input;
+  if (!targets.bluesky && !targets.linkedin && !targets.devto) {
+    return { ok: false, status: 400, error: "Select at least one destination" };
+  }
+  const text = typeof input.text === "string" ? input.text.trim() : "";
+  if ((targets.bluesky || targets.linkedin) && !text) {
+    return { ok: false, status: 400, error: "text is required" };
+  }
+  const articleGiven =
+    input.article !== undefined && input.article !== null && typeof input.article === "object";
+  if (targets.devto && !articleGiven) {
+    return { ok: false, status: 400, error: "dev.to requires an article" };
+  }
+  if (!targets.devto && articleGiven) {
+    return { ok: false, status: 400, error: "article requires dev.to to be selected" };
+  }
+  if (targets.devto && hasImage) {
+    return { ok: false, status: 400, error: "dev.to does not support images in v1" };
+  }
+  if (targets.devto && input.devtoIdentity !== undefined && !isDevtoIdentity(input.devtoIdentity)) {
+    return { ok: false, status: 400, error: "Unknown dev.to identity" };
+  }
+  const identity: DevtoIdentity | undefined = isDevtoIdentity(input.devtoIdentity)
+    ? input.devtoIdentity
+    : devtoIdentities()[0];
+  let article: DevtoArticle | undefined;
+  if (targets.devto && articleGiven) {
+    article = input.article as DevtoArticle;
+    const errors = validateArticle(article);
+    if (errors.length > 0) return { ok: false, status: 400, error: errors[0] };
+    if (identity === "tessera" && !isDisclosurePresent(article.bodyMarkdown)) {
+      return { ok: false, status: 400, error: "Tessera-authored posts must include the disclosure line" };
+    }
+  }
+  return articleGiven && targets.devto ? { ok: true, text, article, identity } : { ok: true, text, identity };
 }

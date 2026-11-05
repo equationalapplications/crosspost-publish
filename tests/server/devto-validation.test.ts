@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   DISCLOSURE_LINE,
   normalizeTags,
@@ -108,5 +108,156 @@ describe("isDisclosurePresent", () => {
 
   it("matches curly apostrophes (rich-text paste)", () => {
     expect(isDisclosurePresent(DISCLOSURE_LINE.replace(/'/g, "\u2019"))).toBe(true);
+  });
+});
+
+import {
+  devtoIdentities,
+  isDevtoKeyConfigured,
+  resolveDevtoIdentityKey,
+  validatePublishRequest,
+} from "../../server/publishers/devto-validation.js";
+
+describe("identity resolution", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("reports only configured identities, Kurt first", () => {
+    vi.stubEnv("DEVTO_API_KEY", "k");
+    expect(devtoIdentities()).toEqual(["kurt"]);
+    vi.stubEnv("DEVTO_API_KEY_TESSERA", "t");
+    expect(devtoIdentities()).toEqual(["kurt", "tessera"]);
+    vi.stubEnv("DEVTO_API_KEY", "");
+    expect(devtoIdentities()).toEqual(["tessera"]);
+  });
+
+  it("isDevtoKeyConfigured + resolveDevtoIdentityKey map the closed enum to env vars", () => {
+    vi.stubEnv("DEVTO_API_KEY", "k");
+    vi.stubEnv("DEVTO_API_KEY_TESSERA", "t");
+    expect(isDevtoKeyConfigured("tessera")).toBe(true);
+    expect(resolveDevtoIdentityKey("tessera")).toBe("t");
+    expect(isDevtoKeyConfigured("kurt")).toBe(true);
+    vi.stubEnv("DEVTO_API_KEY_TESSERA", "");
+    expect(isDevtoKeyConfigured("tessera")).toBe(false);
+    expect(resolveDevtoIdentityKey("tessera")).toBeUndefined();
+  });
+});
+
+describe("validatePublishRequest", () => {
+  afterEach(() => vi.unstubAllEnvs()); // "defaults an omitted identity" stubs DEVTO_API_KEY — keep it from leaking
+  const both = { bluesky: true, linkedin: true, devto: false };
+
+  it("requires text when Bluesky or LinkedIn is targeted", () => {
+    expect(validatePublishRequest({ text: "", targets: both, hasImage: false })).toEqual({
+      ok: false,
+      status: 400,
+      error: "text is required",
+    });
+  });
+
+  it("allows a dev.to-only publish with no text", () => {
+    const r = validatePublishRequest({
+      targets: { bluesky: false, linkedin: false, devto: true },
+      article: { title: "T", bodyMarkdown: "B" },
+      hasImage: false,
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("400s when no destination at all is targeted", () => {
+    expect(
+      validatePublishRequest({ text: "x", targets: { bluesky: false, linkedin: false, devto: false }, hasImage: false }),
+    ).toEqual({ ok: false, status: 400, error: "Select at least one destination" });
+  });
+
+  it("400s on devto without article", () => {
+    expect(
+      validatePublishRequest({ text: "x", targets: { ...both, devto: true }, hasImage: false }),
+    ).toEqual({ ok: false, status: 400, error: "dev.to requires an article" });
+  });
+
+  it("400s on article without devto", () => {
+    expect(
+      validatePublishRequest({ text: "x", targets: both, article: { title: "T", bodyMarkdown: "B" }, hasImage: false }),
+    ).toEqual({ ok: false, status: 400, error: "article requires dev.to to be selected" });
+  });
+
+  it("400s on article + image", () => {
+    expect(
+      validatePublishRequest({
+        text: "x",
+        targets: { ...both, devto: true },
+        article: { title: "T", bodyMarkdown: "B" },
+        hasImage: true,
+      }),
+    ).toEqual({ ok: false, status: 400, error: "dev.to does not support images in v1" });
+  });
+
+  it("400s on an invalid article (delegates to validateArticle)", () => {
+    expect(
+      validatePublishRequest({
+        targets: { bluesky: false, linkedin: false, devto: true },
+        article: { title: "", bodyMarkdown: "B" },
+        hasImage: false,
+      }),
+    ).toEqual({ ok: false, status: 400, error: "title is required" });
+  });
+
+  it("400s on a Tessera article without the disclosure line", () => {
+    expect(
+      validatePublishRequest({
+        targets: { bluesky: false, linkedin: false, devto: true },
+        article: { title: "T", bodyMarkdown: "No disclosure here." },
+        devtoIdentity: "tessera",
+        hasImage: false,
+      }),
+    ).toEqual({ ok: false, status: 400, error: "Tessera-authored posts must include the disclosure line" });
+  });
+
+  it("accepts a Tessera article with the disclosure line", () => {
+    const r = validatePublishRequest({
+      targets: { bluesky: false, linkedin: false, devto: true },
+      article: { title: "T", bodyMarkdown: `Intro.\n\nPosted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.` },
+      devtoIdentity: "tessera",
+      hasImage: false,
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("400s on an unknown devtoIdentity when devto is targeted", () => {
+    expect(
+      validatePublishRequest({
+        targets: { bluesky: false, linkedin: false, devto: true },
+        article: { title: "T", bodyMarkdown: "B" },
+        devtoIdentity: "root",
+        hasImage: false,
+      }),
+    ).toEqual({ ok: false, status: 400, error: "Unknown dev.to identity" });
+  });
+
+  it("ignores a stale devtoIdentity when devto is NOT targeted", () => {
+    const r = validatePublishRequest({ text: "x", targets: both, devtoIdentity: "root", hasImage: false });
+    expect(r.ok).toBe(true);
+  });
+
+  it("defaults an omitted identity to the first configured identity", () => {
+    vi.stubEnv("DEVTO_API_KEY", "k");
+    const r = validatePublishRequest({
+      targets: { bluesky: false, linkedin: false, devto: true },
+      article: { title: "T", bodyMarkdown: "B" },
+      hasImage: false,
+    });
+    expect(r.ok).toBe(true); // Kurt default: no disclosure requirement
+    if (r.ok) expect(r.identity).toBe("kurt");
+  });
+
+  it("returns the chosen identity on the ok branch so the route can pass it to publishAll", () => {
+    const r = validatePublishRequest({
+      targets: { bluesky: false, linkedin: false, devto: true },
+      article: { title: "T", bodyMarkdown: `x\n\nPosted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.` },
+      devtoIdentity: "tessera",
+      hasImage: false,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.identity).toBe("tessera");
   });
 });
