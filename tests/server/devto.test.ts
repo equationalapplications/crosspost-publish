@@ -3,7 +3,8 @@ import { createServer, type Server } from "node:http";
 import { publishDevto, DEVTO_API_BASE } from "../../server/publishers/devto.js";
 
 let requests = 0;
-let mode: "ok" | "500" | "hang" | "422" | "429" | "html201" | "nullid" = "ok";
+let mode: "ok" | "500" | "hang" | "422" | "429" | "html201" | "badid" = "ok";
+let badId: unknown = null;
 
 const server: Server = createServer((req, res) => {
   requests += 1;
@@ -14,11 +15,12 @@ const server: Server = createServer((req, res) => {
     // captive-portal / proxy style: 2xx with a non-JSON body
     res.writeHead(201, { "content-type": "text/html" });
     res.end("<html>ok</html>");
-  } else if (mode === "nullid") {
-    // hostile 2xx: JSON body whose id is not a number — the runtime guard must
-    // treat it as an unknown outcome (the static cast validates nothing)
+  } else if (mode === "badid") {
+    // hostile 2xx: JSON body whose id is not a real Forem article id — the
+    // runtime guard must treat it as an unknown outcome (the static cast
+    // validates nothing)
     res.writeHead(201, { "content-type": "application/json" });
-    res.end(JSON.stringify({ id: null, url: "https://dev.to/kurt/test-article" }));
+    res.end(JSON.stringify({ id: badId, url: "https://dev.to/kurt/test-article" }));
   } else if (mode === "422") {
     res.writeHead(422, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Validation failed", status: "422" }));
@@ -107,12 +109,19 @@ describe("publishDevto", () => {
     expect(r.resultKind).toBe("unknown"); // the UI duplicate guard must stay locked
   });
 
-  it("maps a 2xx with a non-numeric id to an unknown outcome, never `created`", async () => {
-    mode = "nullid";
+  it.each([
+    [null, "null"],
+    [0, "zero"],
+    [-5, "negative"],
+    [1.5, "fractional"],
+    [2 ** 53, "unsafe-integer"],
+  ])("maps a 2xx with a non-article id (%s: %s) to an unknown outcome, never `created`", async (id) => {
+    mode = "badid";
+    badId = id;
     const r = await publishDevto(ctx, "kurt");
     expect(requests).toBe(1);
     expect(r.ok).toBe(false);
-    expect(r.resultKind).toBe("unknown"); // id: null cannot identify an article — guard stays locked
+    expect(r.resultKind).toBe("unknown"); // cannot identify a real article — guard stays locked
   });
 
   it("returns a missing-key failure naming the env var when the identity key is absent", async () => {

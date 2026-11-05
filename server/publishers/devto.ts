@@ -98,12 +98,12 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
       message: `dev.to (${identity}): rejected the article (${res.status}): ${parsed.error ?? bodyText.slice(0, 200)}`,
     };
   }
-  if (typeof parsed.id !== "number") {
-    // A 2xx we cannot tie to a numeric article id (captive-portal HTML,
-    // id-less success, or a non-numeric/null `id` — the cast above validates
-    // nothing at runtime) is an UNKNOWN outcome, never a success — reporting
-    // `created` here would auto-unlock the UI duplicate guard on a
-    // possibly-double-posted article.
+  if (typeof parsed.id !== "number" || !Number.isSafeInteger(parsed.id) || parsed.id <= 0) {
+    // A 2xx we cannot tie to a real Forem article id (captive-portal HTML,
+    // id-less success, or a null/non-numeric/zero/negative/fractional/
+    // unsafe-integer `id` — the cast above validates nothing at runtime) is
+    // an UNKNOWN outcome, never a success — reporting `created` here would
+    // auto-unlock the UI duplicate guard on a possibly-double-posted article.
     return unknownOutcome(identity, "dev.to returned an unparseable or id-less success response");
   }
   return {
