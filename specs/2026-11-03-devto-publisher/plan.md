@@ -80,11 +80,6 @@ describe("test-environment guard", () => {
 import { defineConfig, mergeConfig } from "vitest/config";
 import viteConfig from "./vite.config";
 
-// Pin NODE_ENV for the createApp() listen-guard; the DEVTO_API_BASE_OVERRIDE gate
-// keys on VITEST instead (vitest sets it; production deployments do not). This file
-// is test-only infrastructure — nothing here leaks into production.
-process.env.NODE_ENV = "test";
-
 // vitest.config.ts REPLACES vite.config.ts (no merge): import and merge it so the
 // react() plugin and the rest of the Vite config apply to the jsdom UI tests.
 export default mergeConfig(
@@ -1108,7 +1103,9 @@ export function createApp(): Express {
   return app;
 }
 
-if (process.env.NODE_ENV !== "test") {
+if (process.env.VITEST) {
+  console.log("not listening (test mode)");
+} else {
   createApp().listen(PORT, "127.0.0.1", () => {
     console.log(`API listening on http://127.0.0.1:${PORT}`);
   });
@@ -1339,7 +1336,7 @@ describe("POST /api/publish (real app)", () => {
 });
 ```
 
-(Note: `createApp()` boots at `NODE_ENV === "test"` without listening, and vitest sets that env var — the `NODE_ENV !== "test"` guard around `listen` in `server/index.ts` is what makes this import safe. If a test run shows the guard is wrong for your vitest version, assert `process.env.NODE_ENV` in the first failing test before changing the guard.)
+(Note: `createApp()` is import-safe under vitest because the `listen` call is gated on `process.env.VITEST` (vitest sets it; a production deploy never does — unlike NODE_ENV, which a deploy could set to "test" and silently produce a no-listener process, hence the explicit "not listening" log). If a test run shows the guard is wrong for your vitest version, assert `process.env.VITEST` in the first failing test before changing the guard.)
 
 - [ ] **Step 4: Run to verify pass** — Run: `npm test`. Expected: all PASS.
 
@@ -1366,6 +1363,8 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 **State additions:** `devto: boolean`, `devtoIdentity: string | null`, `title`, `bodyMarkdown`, `canonicalUrl`, `description`, `tags` (comma-separated string), `identities: string[]` (from health), `devtoLocked: boolean`, `devtoCheckConfirmed: boolean`.
 
 **Identity state discipline (Kurt-only config is day-one):** when the health response arrives, if `devtoIdentity` is still `null` and `identities.length > 0` → set it to `identities[0]` (Kurt in the single-key setup). In the submit path, if `devtoIdentity` is still `null` at submit time, **omit the key entirely** — the server then defaults to the first configured identity. Never serialize `"devtoIdentity": null`: the validator's unknown-identity check would 400 every dev.to submit in exactly the one-key configuration most users start with.
+
+**Fail closed until identities are known (MAJOR-9 fix):** dev.to submission is **disabled until `/api/health` has resolved** — `devtoReady = false` until the health fetch settles. While `!devtoReady`, the dev.to checkbox is disabled (cannot be checked) and a dev.to-including submit is blocked (Publish does nothing devto-side). If the health fetch **fails** (network error / non-ok): show `devtoHealthError` with the result rows note "dev.to unavailable — retry", and dev.to stays disabled; **no unnamed submit ever happens** (`pending:none` exists only for the loaded-but-empty case, which cannot occur because empty identities keep dev.to disabled too — the state is kept for rule-1 completeness). The server would default the identity correctly, but the LOCK could then record no name — and an unnamed lock is the wrong-dashboard re-post path, so the UI refuses rather than trusting the default. Tests: submit before health resolves → devto payload NOT sent; health rejects → devto stays disabled with the retry message. Await the identity state (health settled + re-render) before asserting any flag value.
 
 **sessionStorage key:** `crosspost.devtoPending` (value `"pending:<identity>"`, e.g. `"pending:tessera"`).
 
@@ -1402,6 +1401,13 @@ async function fillArticleForm() {
   fireEvent.change(screen.getByLabelText(/article body/i), { target: { value: "B" } });
 }
 
+async function checkDevto() {
+  const box = screen.getByRole("checkbox", { name: /^dev\.to$/i }) as HTMLInputElement;
+  await waitFor(() => expect(box).not.toBeDisabled()); // devtoReady — fail-closed until health resolves
+  fireEvent.click(box);
+  return box;
+}
+
 describe("dev.to submit-time lock", () => {
   beforeEach(() => sessionStorage.clear());
   afterEach(() => { vi.unstubAllGlobals(); sessionStorage.clear(); });
@@ -1410,7 +1416,7 @@ describe("dev.to submit-time lock", () => {
     const f = healthThen(created);
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     expect(sessionStorage.getItem("crosspost.devtoPending")).toBe("pending:kurt"); // default identity rides in the flag
@@ -1423,7 +1429,7 @@ describe("dev.to submit-time lock", () => {
     const f = healthThen(unknownRow);
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await waitFor(() => screen.getByLabelText(/checked .+dev\.to account/i));
@@ -1436,7 +1442,7 @@ describe("dev.to submit-time lock", () => {
     const f = healthThen(rejectedRow);
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await waitFor(() => expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull());
@@ -1462,7 +1468,7 @@ describe("dev.to submit-time lock", () => {
     vi.stubGlobal("fetch", f);
     render(<App />);
     fireEvent.change(screen.getByLabelText(/post text/i), { target: { value: "short post" } });
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     fireEvent.click(screen.getByLabelText(/bluesky/i));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
@@ -1481,7 +1487,8 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: true, resultKind: "created", url: "https://dev.to/x" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: /^dev\.to$/i })).not.toBeDisabled()); // devtoReady
+    await checkDevto();
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await screen.findByText("https://dev.to/x");
@@ -1491,13 +1498,39 @@ describe("dev.to submit-time lock", () => {
     expect(screen.queryByLabelText(/publish as/i)).toBeNull(); // selector hidden for a single identity
   });
 
+  it("blocks the dev.to submit until health resolves — no unnamed lock (fail closed)", async () => {
+    let resolveHealth: (v: unknown) => void = () => {};
+    const f = vi.fn()
+      .mockReturnValueOnce(new Promise((res) => { resolveHealth = res; })) // health hangs
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: true, resultKind: "created", url: "https://dev.to/x" }] }) });
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    const devtoBox = screen.getByRole("checkbox", { name: /^dev\.to$/i }) as HTMLInputElement;
+    expect(devtoBox.disabled).toBe(true); // identities unknown → dev.to disabled
+    fireEvent.click(devtoBox);
+    await fillArticleForm();
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    // dev.to must NOT go out unnamed: no publish call happened at all (bluesky not selected)
+    expect(f).toHaveBeenCalledTimes(1); // only the health call
+    expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull();
+    resolveHealth({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt"] }) });
+  });
+
+  it("health failure keeps dev.to disabled with a retry message", async () => {
+    const f = vi.fn().mockRejectedValueOnce(new Error("health down"));
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    await waitFor(() => screen.getByText(/dev\.to unavailable — retry/i));
+    expect((screen.getByRole("checkbox", { name: /^dev\.to$/i }) as HTMLInputElement).disabled).toBe(true);
+  });
+
   it("re-enables the image picker while dev.to is locked (Bluesky/LinkedIn keep images)", async () => {
     const f = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt", "tessera"] }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: false, resultKind: "unknown", message: "may exist" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(true); // targeted, not locked
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
@@ -1509,7 +1542,7 @@ describe("dev.to submit-time lock", () => {
     vi.stubGlobal("fetch", healthThen(created));
     render(<App />);
     await waitFor(() => screen.getByLabelText(/publish as/i));
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     const select = screen.getByLabelText(/publish as/i) as HTMLSelectElement;
     expect(select.value).toBe("kurt"); // default = first identity
     fireEvent.change(select, { target: { value: "tessera" } });
@@ -1519,7 +1552,7 @@ describe("dev.to submit-time lock", () => {
   it("disables the image picker when dev.to is checked", async () => {
     vi.stubGlobal("fetch", healthThen(created));
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(true);
   });
 
@@ -1530,7 +1563,7 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "bluesky", ok: false, message: "not configured" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await waitFor(() => screen.getByLabelText(/checked .+dev\.to account/i));
@@ -1556,7 +1589,7 @@ describe("dev.to submit-time lock", () => {
       .mockReturnValueOnce(new Promise((res) => { resolveFirst = res; })); // first publish hangs until we resolve it
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     const publish = screen.getByRole("button", { name: /publish now/i });
     fireEvent.click(publish);
@@ -1572,7 +1605,7 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: "dev.to does not support images in v1" }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    await checkDevto();
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await waitFor(() => expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull());
