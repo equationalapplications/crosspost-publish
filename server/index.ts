@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { publishAll } from "./publishers/registry.js";
 import { validatePublishRequest, devtoIdentities } from "./publishers/devto-validation.js";
+import rateLimit from "express-rate-limit";
 import type { PublishTargets } from "./publishers/types.js";
 
 const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? 3001);
@@ -30,6 +31,18 @@ function parseFlag(v: unknown): boolean {
 export function createApp(): Express {
   const app = express();
   app.use(express.json({ limit: "2mb" })); // spec limit; normal text worst case ~1.2MB. Adversarial control-char/lone-surrogate content can serialize to ~2.4MB → 413, which is a deterministic 4xx and keeps the lock logic safe. Do not raise the limit (spec).
+
+  // Rate limit publishes: this server automates real cross-posts, so a runaway local
+  // loop hammering /api/publish would spam the actual Bluesky/LinkedIn/dev.to accounts.
+  // 20/min is far above any interactive use.
+  const publishLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 20,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: "Too many publish requests — wait a minute and retry" },
+  });
+  app.use("/api/publish", publishLimiter);
 
   app.post("/api/publish", upload.single("image"), async (req: Request, res: Response) => {
     try {
