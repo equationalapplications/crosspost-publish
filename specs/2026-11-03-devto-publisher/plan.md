@@ -20,7 +20,7 @@
 - Env vars: `DEVTO_API_KEY` (Kurt), `DEVTO_API_KEY_TESSERA` (optional). Keys never transit the client or chat.
 - Tessera-authored posts: the server 400s when `devtoIdentity` is `"tessera"` and `bodyMarkdown` lacks the disclosure line — case-insensitive, whitespace-normalised substring match. Disclosure line (exact string): `Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.`
 - `/api/publish` request rules: `text` required only when Bluesky or LinkedIn targeted; `devto: true` without `article` → 400; `article` without `devto: true` → 400; article fields + image → 400 (and the UI disables the image picker so users never hit it); at-least-one-destination check includes `devto`.
-- JSON body limit: `3mb` (Express default 100kb would 413 a long `bodyMarkdown`; 400k chars of worst-case `\u00XX`-escaped non-ASCII is ~2.4 MB, so 3mb leaves headroom). multer keeps handling multipart; `express.json()` handles JSON. The route's error middleware must pass through `express.json()`'s own 4xx statuses (400 malformed JSON, 413 over-limit) instead of rewriting them to 500 — the UI's unlock rule depends on deterministic 4xx being distinguishable from 5xx.
+- JSON body limit: `2mb` (per the approved spec — DO NOT raise it): `JSON.stringify` emits non-ASCII characters raw (UTF-8), so the UI's worst case is ~1.2 MB for 400k CJK-range chars — comfortably under 2 MiB. multer keeps handling multipart; `express.json()` handles JSON. The route's error middleware must pass through `express.json()`'s own 4xx statuses (400 malformed JSON, 413 over-limit) instead of rewriting them to 500 — the UI's unlock rule depends on deterministic 4xx being distinguishable from 5xx, and 413 passthrough keeps an over-limit submit deterministic even though the real UI never hits it.
 - `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx or a nothing-sent failure (auto-unlocks the UI lock), `unknown` = timeout/5xx/transport (keeps it locked until the "checked dev.to" confirmation). Only devto rows carry it (`devto.ts` and the registry's unconfigured-key row); other publishers leave it undefined.
 - Duplicate-article defence is client-side by design (stateless app): sessionStorage-backed submit-time lock, per-browser-tab; closing the tab clears it. Accepted v1 tradeoff — do not add server-side state.
 - ESLint + `npm run build` must pass at every commit; existing behavior (Bluesky/LinkedIn FormData path) must not regress.
@@ -49,10 +49,11 @@ npm install --save-dev vitest jsdom @testing-library/react @testing-library/user
 ```ts
 import { defineConfig } from "vitest/config";
 
-// Pin NODE_ENV: the publisher's DEVTO_API_BASE_OVERRIDE gate checks NODE_ENV === "test",
-// and vitest only defaults NODE_ENV when it is unset — an exported NODE_ENV=production
-// would send publisher tests at the real dev.to host.
-process.env.NODE_ENV ??= "test";
+// Pin NODE_ENV UNCONDITIONALLY: the publisher's DEVTO_API_BASE_OVERRIDE gate checks
+// NODE_ENV === "test", and an exported NODE_ENV=production would otherwise send
+// publisher tests at the real dev.to host. This file is test-only infrastructure —
+// nothing here leaks into production.
+process.env.NODE_ENV = "test";
 
 export default defineConfig({
   test: {
@@ -86,12 +87,18 @@ export default defineConfig({
 - [ ] **Step 4: Write the smoke test** — `tests/ui/smoke.test.tsx`:
 
 ```tsx
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import App from "../../src/App";
 
 describe("App smoke", () => {
-  it("renders the publish surface", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("renders the publish surface", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, devtoIdentities: [] }),
+    }));
     render(<App />);
     expect(screen.getByRole("button", { name: /publish now/i })).toBeTruthy();
   });
@@ -288,6 +295,9 @@ export function validateArticle(article: DevtoArticle): string[] {
     if (host && host !== CANONICAL_HOST) {
       errors.push("canonicalUrl host must be exactly equationalapplications.com");
     }
+  }
+  if (article.description !== undefined && typeof article.description !== "string") {
+    errors.push("description must be a string");
   }
   return errors;
 }
@@ -667,13 +677,17 @@ import { createServer, type Server } from "node:http";
 import { publishDevto, DEVTO_API_BASE } from "../../server/publishers/devto.js";
 
 let requests = 0;
-let mode: "ok" | "500" | "hang" | "422" | "429" = "ok";
+let mode: "ok" | "500" | "hang" | "422" | "429" | "html201" = "ok";
 
 const server: Server = createServer((req, res) => {
   requests += 1;
   if (mode === "ok") {
     res.writeHead(201, { "content-type": "application/json" });
     res.end(JSON.stringify({ id: 42, url: "https://dev.to/kurt/test-article" }));
+  } else if (mode === "html201") {
+    // captive-portal / proxy style: 2xx with a non-JSON body
+    res.writeHead(201, { "content-type": "text/html" });
+    res.end("<html>ok</html>");
   } else if (mode === "422") {
     res.writeHead(422, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Validation failed", status: "422" }));
@@ -754,12 +768,21 @@ describe("publishDevto", () => {
     expect(r.message).toMatch(/429/);
   });
 
+  it("maps a 2xx with an unparseable body to an unknown outcome, never `created`", async () => {
+    mode = "html201";
+    const r = await publishDevto(ctx, "kurt");
+    expect(requests).toBe(1);
+    expect(r.ok).toBe(false);
+    expect(r.resultKind).toBe("unknown"); // the UI duplicate guard must stay locked
+  });
+
   it("returns a missing-key failure naming the env var when the identity key is absent", async () => {
     vi.stubEnv("DEVTO_API_KEY_TESSERA", "");
     mode = "ok";
     const r = await publishDevto(ctx, "tessera");
     expect(requests).toBe(0); // no outbound request without a key
     expect(r.ok).toBe(false);
+    expect(r.resultKind).toBe("rejected"); // deterministic, nothing sent — UI auto-unlocks
     expect(r.message).toMatch(/DEVTO_API_KEY_TESSERA/);
   });
 
@@ -839,7 +862,12 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
   const key = resolveDevtoIdentityKey(identity);
   if (!key) {
     const envName = identity === "kurt" ? "DEVTO_API_KEY" : "DEVTO_API_KEY_TESSERA";
-    return { networkId, ok: false, message: `dev.to not configured for this identity: set ${envName} in .env` };
+    return {
+      networkId,
+      ok: false,
+      resultKind: "rejected", // deterministic, nothing sent — UI auto-unlocks
+      message: `dev.to not configured for this identity: set ${envName} in .env`,
+    };
   }
   const article = ctx.article!;
   const payload = {
@@ -892,6 +920,12 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
       resultKind: "rejected",
       message: `dev.to rejected the article (${res.status}): ${parsed.error ?? bodyText.slice(0, 200)}`,
     };
+  }
+  if (parsed.id === undefined) {
+    // A 2xx we cannot tie to an article id (captive-portal HTML, id-less success)
+    // is an UNKNOWN outcome, never a success — reporting `created` here would
+    // auto-unlock the UI duplicate guard on a possibly-double-posted article.
+    return unknownOutcome("dev.to returned an unparseable or id-less success response");
   }
   return {
     networkId,
@@ -982,7 +1016,7 @@ return settled.map((s, i) =>
 ```ts
 export function createApp(): Express {
   const app = express();
-  app.use(express.json({ limit: "3mb" })); // default 100kb would 413; 400k worst-case-escaped chars ≈ 2.4MB, 3mb leaves headroom
+  app.use(express.json({ limit: "2mb" })); // spec limit; JSON.stringify worst case ~1.2MB — 2MiB has headroom
   // ...upload, /api/publish, /api/health, static fallback, error middleware...
   return app;
 }
@@ -1000,7 +1034,9 @@ if (process.env.NODE_ENV !== "test") {
 app.post("/api/publish", upload.single("image"), async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const targets = {
+    // Annotated PublishTargets: the devtoIdentity assignment below is a type error
+    // on an inferred literal type (TS2339) — the annotation is required for tsc.
+    const targets: PublishTargets = {
       bluesky: parseFlag(body.bluesky),
       linkedin: parseFlag(body.linkedin),
       devto: parseFlag(body.devto),
@@ -1105,6 +1141,10 @@ beforeAll(async () => {
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.on("listening", r));
   appUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+beforeEach(() => {
+  forseen = {}; // module-level stub state must not leak between tests
 });
 
 afterAll(() => {
@@ -1229,7 +1269,7 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 
 **sessionStorage key:** `crosspost.devtoPending` (value `"1"`).
 
-**Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })`. When `devtoLocked` → the request is the **existing FormData path for the remaining targets only** — it never contains `devto`, `article`, or `devtoIdentity`, whatever the checkbox shows (locked dev.to cannot ride along on a Bluesky/LinkedIn submit). When devto is unchecked → the existing FormData path unchanged.
+**Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: text || undefined, bluesky, linkedin, devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })` — the other selected targets and `text` ride in the SAME JSON body, so a combined dev.to+Bluesky submit publishes both. When `devtoLocked` → the request is the **existing FormData path for the remaining targets only** — it never contains `devto`, `article`, or `devtoIdentity`, whatever the checkbox shows (locked dev.to cannot ride along on a Bluesky/LinkedIn submit). When devto is unchecked → the existing FormData path unchanged.
 
 **Lock rules (the heart of this task):**
 1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "1"` and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
@@ -1306,8 +1346,33 @@ describe("dev.to submit-time lock", () => {
     sessionStorage.setItem("crosspost.devtoPending", "1");
     vi.stubGlobal("fetch", healthThen(created));
     render(<App />);
-    expect((screen.getByLabelText(/dev\.to/i) as HTMLInputElement).disabled).toBe(true);
+    const devtoBox = screen.getByLabelText(/dev\.to/i) as HTMLInputElement;
+    expect(devtoBox.disabled).toBe(true);
+    expect(devtoBox.checked).toBe(true); // spec rule 6: locked checkbox renders checked
     await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
+  });
+
+  it("an unlocked combined dev.to+Bluesky submit carries both targets in one JSON body", async () => {
+    const f = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt", "tessera"] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [
+        { networkId: "devto", ok: true, resultKind: "created", url: "https://dev.to/x" },
+        { networkId: "bluesky", ok: false, message: "not configured" },
+      ] }) });
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/post text/i), { target: { value: "short post" } });
+    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByLabelText(/bluesky/i));
+    await fillArticleForm();
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    await screen.findByText("https://dev.to/x"); // devto row renders
+    const init = f.mock.calls[1]?.[1] as RequestInit;
+    const parsed = JSON.parse(init.body as string);
+    expect(parsed.devto).toBe(true);
+    expect(parsed.bluesky).toBe(true);
+    expect(parsed.text).toBe("short post");
+    expect(parsed.article.title).toBe("T");
   });
 
   it("shows the identity selector when more than one identity is configured", async () => {
@@ -1387,7 +1452,7 @@ describe("dev.to submit-time lock", () => {
 - [ ] **Step 2: Run to verify failure** — Run: `npm test`. Expected: FAIL (no dev.to UI yet).
 
 - [ ] **Step 3: Implement `src/App.tsx`** — extend the existing component:
-  - `useEffect` on mount: `fetch("/api/health")` → set `identities`; read `sessionStorage["crosspost.devtoPending"]` → set `devtoLocked`.
+  - `useEffect` on mount: `fetch("/api/health")` → set `identities`, with `.catch(() => setIdentities([]))` — an unhandled health-fetch rejection fails `tests/ui/smoke.test.tsx`, which renders `App` without stubbing `fetch`; also stub `fetch` in the smoke test for determinism. Read `sessionStorage["crosspost.devtoPending"]` → set `devtoLocked`.
   - When `devto` checked: render title input (`Post title`, maxLength 128), article textarea (`Article body`, maxLength 400000), canonical URL input (placeholder showing the apex-host rule), description input with a live `~140` counter (`description.length` shown; display-only), tags input (comma-separated, ≤ 4 after normalization). Hide the short-form text requirement: when devto-only, `canPublish` requires a non-empty title + body instead of text.
   - Identity selector `<select aria-label="publish as">` rendered only when `identities.length > 1`, options labeled `Kurt` / `Tessera`, default = first identity.
   - Image picker input gets `disabled={devto}` and clearing `file` when devto is toggled on.
