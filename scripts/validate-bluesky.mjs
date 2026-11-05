@@ -9,7 +9,7 @@ if (!handle || !password) {
   console.error("MISSING: BLUESKY_HANDLE / BLUESKY_APP_PASSWORD not set");
   process.exit(2);
 }
-const agent = new BskyAgent({ service: process.env.BLUESKY_SERVICE || "https://bsky.social" });
+const agent = new BskyAgent({ service: process.env.BLUESKY_SERVICE ?? "https://bsky.social" });
 try {
   await agent.login({ identifier: handle, password });
   console.log(JSON.stringify({
