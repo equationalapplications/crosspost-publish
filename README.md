@@ -55,6 +55,18 @@ For posts **with an image**, the API server runs the same three steps Microsoft 
 
 Between steps 2 and 3, the server **polls** `GET https://api.linkedin.com/rest/assets/{assetId}?fields=recipes,id` until a `recipes[]` entry has **`status: AVAILABLE`**, or (if that GET is not usable) waits **~1.5s** before creating the UGC post. Very large assets may still need a longer wait or manual retry.
 
+## dev.to (long-form articles)
+
+When **dev.to** is selected, the server publishes a long-form **article** (not a short post) via the Forem API: a **title**, Markdown **body**, up to **4 normalized tags**, an optional **description**, and an optional **canonical URL** pointing back to the original post. dev.to targeting does not support images in v1.
+
+Generate an API key at [dev.to/settings/extensions](https://dev.to/settings/extensions) (Dev.to API keys → generate). Two identities are supported, each with its own env var: `DEVTO_API_KEY` (Kurt's account) and `DEVTO_API_KEY_TESSERA` (Tessera's account). The UI shows an identity selector listing whichever identities have a key configured; if none is picked, the first configured identity is used.
+
+**Tessera disclosure rule:** posts published under the Tessera identity must contain the disclosure line ("Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.") in the body. This is enforced server-side — the request is rejected with a 400 if the line is missing.
+
+**Canonical URL rule:** if a canonical URL is given, it must be a valid `https://` URL whose host is exactly `equationalapplications.com` (no `www.` or other subdomains).
+
+**No auto-retry, locked until you check:** dev.to publishes are **never auto-retried**. If the outcome is unknown (timeout, network error, 5xx, 429, or an unparseable response), the article may still have been created, so the dev.to fields stay **locked** in the UI until you verify on dev.to that no duplicate exists (check the identity's dashboard or `GET /api/articles/me`). The lock flag lives in `sessionStorage`, so the limitation is **per browser tab**: opening the app in a new tab (or losing that tab's session) drops the lock, and any pre-existing pending state from a crash is restored only within the same tab.
+
 ## Run locally (development)
 
 Two processes: Vite on **5173** (proxies `/api` → API) and the API on **3001**.
