@@ -57,5 +57,7 @@ export function isDisclosurePresent(bodyMarkdown: string): boolean {
 }
 
 export function normalizeForMatch(s: string): string {
-  return s.toLowerCase().replace(/\s+/g, " ").trim();
+  // \u2019 (curly right single quote) → straight apostrophe: rich-text editors emit
+  // curly quotes and a compliant Tessera post must not 400 on paste.
+  return s.toLowerCase().replace(/[\u2018\u2019\u02BC]/g, "'").replace(/\s+/g, " ").trim();
 }

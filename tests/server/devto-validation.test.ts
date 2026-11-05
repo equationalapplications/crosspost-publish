@@ -86,3 +86,27 @@ describe("normalizeTags", () => {
     expect(normalizeTags(undefined)).toEqual([]);
   });
 });
+
+import { isDisclosurePresent, normalizeForMatch } from "../../server/publishers/devto-validation.js";
+
+describe("isDisclosurePresent", () => {
+  it("matches the exact line", () => {
+    expect(isDisclosurePresent(`Intro.\n\n${DISCLOSURE_LINE}\n\nBody.`)).toBe(true);
+  });
+
+  it("matches case-insensitively", () => {
+    expect(isDisclosurePresent(DISCLOSURE_LINE.toUpperCase())).toBe(true);
+  });
+
+  it("matches across whitespace differences", () => {
+    expect(isDisclosurePresent("Posted  by Tessera,   Kurt VanDusen's executive\nAI agent at Equational\nApplications.")).toBe(true);
+  });
+
+  it("does not match when the disclosure is absent", () => {
+    expect(isDisclosurePresent("A perfectly ordinary post by a human.")).toBe(false);
+  });
+
+  it("matches curly apostrophes (rich-text paste)", () => {
+    expect(isDisclosurePresent(DISCLOSURE_LINE.replace(/'/g, "\u2019"))).toBe(true);
+  });
+});
