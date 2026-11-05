@@ -47,7 +47,8 @@ npm install --save-dev vitest jsdom @testing-library/react @testing-library/user
 - [ ] **Step 2: Create `vitest.config.ts`**
 
 ```ts
-import { defineConfig } from "vitest/config";
+import { defineConfig, mergeConfig } from "vitest/config";
+import viteConfig from "./vite.config";
 
 // Pin NODE_ENV UNCONDITIONALLY: the publisher's DEVTO_API_BASE_OVERRIDE gate checks
 // NODE_ENV === "test", and an exported NODE_ENV=production would otherwise send
@@ -55,27 +56,32 @@ import { defineConfig } from "vitest/config";
 // nothing here leaks into production.
 process.env.NODE_ENV = "test";
 
-export default defineConfig({
-  test: {
-    // environmentMatchGlobs is deprecated/removed in current vitest — use projects.
-    projects: [
-      {
-        test: {
-          name: "server",
-          environment: "node",
-          include: ["tests/server/**/*.test.ts"],
+// vitest.config.ts REPLACES vite.config.ts (no merge): import and merge it so the
+// react() plugin and the rest of the Vite config apply to the jsdom UI tests.
+export default mergeConfig(
+  viteConfig,
+  defineConfig({
+    test: {
+      // environmentMatchGlobs is deprecated/removed in current vitest — use projects.
+      projects: [
+        {
+          test: {
+            name: "server",
+            environment: "node",
+            include: ["tests/server/**/*.test.ts"],
+          },
         },
-      },
-      {
-        test: {
-          name: "ui",
-          environment: "jsdom",
-          include: ["tests/ui/**/*.test.tsx"],
+        {
+          test: {
+            name: "ui",
+            environment: "jsdom",
+            include: ["tests/ui/**/*.test.tsx"],
+          },
         },
-      },
-    ],
-  },
-});
+      ],
+    },
+  }),
+);
 ```
 
 - [ ] **Step 3: Add the test script** to `package.json` scripts (after `"lint"`):
@@ -966,52 +972,86 @@ git commit -m "feat(devto): Forem publisher, never-auto-retry, created/rejected/
 - [ ] **Step 1: Extend `registry.ts`** — add the devto branch and harden the collection:
 
 ```ts
+import { publishBluesky, isBlueskyConfigured } from "./bluesky.js";
+import { publishLinkedIn, isLinkedInConfigured } from "./linkedin.js";
 import { publishDevto } from "./devto.js";
 import { isDevtoKeyConfigured } from "./devto-validation.js";
 import type { DevtoIdentity, PublishContext, PublishResult, PublishTargets } from "./types.js";
 
 type Job = { networkId: string; promise: Promise<PublishResult> };
-const jobs: Job[] = []; // replaces the old Promise<PublishResult>[] — networkId rides with the job
 
-// bluesky / linkedin branches push { networkId: "bluesky" | "linkedin", promise: ... } —
-// same logic as today, only the wrapper changes.
+// Full publishAll — bluesky/linkedin branches keep their existing logic, wrapped as
+// Jobs so the allSettled fallback can name the network on a rejected promise.
+export async function publishAll(ctx: PublishContext, targets: PublishTargets): Promise<PublishResult[]> {
+  const jobs: Job[] = [];
 
-// devto branch — identity comes from targets ONLY. No re-defaulting here: the route
-// sets targets.devtoIdentity from rules.identity, so validation and publishing cannot
-// disagree about identity.
-if (targets.devto) {
-  const identity: DevtoIdentity | undefined = targets.devtoIdentity;
-  if (identity && isDevtoKeyConfigured(identity)) {
-    jobs.push({ networkId: "devto", promise: publishDevto(ctx, identity) });
-  } else {
-    const envName = identity === "tessera" ? "DEVTO_API_KEY_TESSERA" : "DEVTO_API_KEY";
-    jobs.push({
-      networkId: "devto",
-      promise: Promise.resolve({
-        networkId: "devto",
-        ok: false,
-        resultKind: "rejected" as const, // deterministic, nothing sent — UI auto-unlocks
-        message: `dev.to not configured for this identity: set ${envName} in .env`,
-      }),
-    });
+  if (targets.bluesky) {
+    if (isBlueskyConfigured()) {
+      jobs.push({ networkId: "bluesky", promise: publishBluesky(ctx) });
+    } else {
+      jobs.push({
+        networkId: "bluesky",
+        promise: Promise.resolve({
+          networkId: "bluesky",
+          ok: false,
+          message: "Bluesky not configured: set BLUESKY_HANDLE and BLUESKY_APP_PASSWORD in .env",
+        }),
+      });
+    }
   }
-}
 
-// collection: allSettled, so a rejecting publisher can never drop another network's
-// row — and the fallback row carries the JOB's networkId, so the UI's devto rules
-// still fire (a fallback row with networkId "unknown" would look like a missing
-// devto row and could be misread as an unlock).
-const settled = await Promise.allSettled(jobs.map((j) => j.promise));
-return settled.map((s, i) =>
-  s.status === "fulfilled"
-    ? s.value
-    : {
-        networkId: jobs[i].networkId,
-        ok: false,
-        resultKind: "unknown" as const,
-        message: `Internal error: ${String(s.reason)}`,
-      },
-);
+  if (targets.linkedin) {
+    if (isLinkedInConfigured()) {
+      jobs.push({ networkId: "linkedin", promise: publishLinkedIn(ctx) });
+    } else {
+      jobs.push({
+        networkId: "linkedin",
+        promise: Promise.resolve({
+          networkId: "linkedin",
+          ok: false,
+          message: "LinkedIn not configured: set LINKEDIN_ACCESS_TOKEN and LINKEDIN_PERSON_URN in .env",
+        }),
+      });
+    }
+  }
+
+  // devto branch — identity comes from targets ONLY. No re-defaulting here: the route
+  // sets targets.devtoIdentity from rules.identity, so validation and publishing cannot
+  // disagree about identity.
+  if (targets.devto) {
+    const identity: DevtoIdentity | undefined = targets.devtoIdentity;
+    if (identity && isDevtoKeyConfigured(identity)) {
+      jobs.push({ networkId: "devto", promise: publishDevto(ctx, identity) });
+    } else {
+      const envName = identity === "tessera" ? "DEVTO_API_KEY_TESSERA" : "DEVTO_API_KEY";
+      jobs.push({
+        networkId: "devto",
+        promise: Promise.resolve({
+          networkId: "devto",
+          ok: false,
+          resultKind: "rejected" as const, // deterministic, nothing sent — UI auto-unlocks
+          message: `dev.to not configured for this identity: set ${envName} in .env`,
+        }),
+      });
+    }
+  }
+
+  // collection: allSettled, so a rejecting publisher can never drop another network's
+  // row — and the fallback row carries the JOB's networkId, so the UI's devto rules
+  // still fire (a fallback row with networkId "unknown" would look like a missing
+  // devto row and could be misread as an unlock).
+  const settled = await Promise.allSettled(jobs.map((j) => j.promise));
+  return settled.map((s, i) =>
+    s.status === "fulfilled"
+      ? s.value
+      : {
+          networkId: jobs[i].networkId,
+          ok: false,
+          resultKind: "unknown" as const,
+          message: `Internal error: ${String(s.reason)}`,
+        },
+  );
+}
 ```
 
 - [ ] **Step 2: Wire the route** — in `server/index.ts`, restructure into an exported `createApp()` so the REAL app is testable (this is what catches identity-dropping wiring bugs the pure module cannot see):
@@ -1285,16 +1325,16 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 
 **Identity state discipline (Kurt-only config is day-one):** when the health response arrives, if `devtoIdentity` is still `null` and `identities.length > 0` → set it to `identities[0]` (Kurt in the single-key setup). In the submit path, if `devtoIdentity` is still `null` at submit time, **omit the key entirely** — the server then defaults to the first configured identity. Never serialize `"devtoIdentity": null`: the validator's unknown-identity check would 400 every dev.to submit in exactly the one-key configuration most users start with.
 
-**sessionStorage key:** `crosspost.devtoPending` (value `"1"`).
+**sessionStorage key:** `crosspost.devtoPending` (value `"pending:<identity>"`, e.g. `"pending:tessera"`).
 
 **Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: text || undefined, bluesky, linkedin, devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })` — the other selected targets and `text` ride in the SAME JSON body, so a combined dev.to+Bluesky submit publishes both. When `devtoLocked` → the request is the **existing FormData path for the remaining targets only** — it never contains `devto`, `article`, or `devtoIdentity`, whatever the checkbox shows (locked dev.to cannot ride along on a Bluesky/LinkedIn submit). When devto is unchecked → the existing FormData path unchanged.
 
 **Lock rules (the heart of this task):**
-1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "1"` and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
+1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "pending:<identity>"` (e.g. `"pending:tessera"`) and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
 2. After the response: if the devto result row has `resultKind === "created"` or `"rejected"` → clear the flag, `devtoLocked = false`.
-3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row**, or the response body could not be parsed (e.g. a proxy HTML page — an unparseable 2xx is an unknown outcome, never a success) → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row. Never clear the lock in a `finally` — only the outcome rules above may.
-4. The confirmation checkbox (label: `I checked dev.to — no duplicate article`) is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
-5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` and the confirmation checkbox renders (rule 4) — a reloaded tab always has an exit hatch; the only way to be stuck is to never confirm.
+3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row**, or the response body could not be parsed (e.g. a proxy HTML page — an unparseable 2xx is an unknown outcome, never a success) → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row. Never clear the lock in a `finally` — only the outcome rules above may. **Fail-closed default:** ONLY an explicit `created`, an explicit `rejected`, or a 4xx-without-devto-row unlocks. A missing or unrecognized `resultKind` keeps the lock.
+4. The confirmation checkbox label NAMES THE ACCOUNT: `I checked <Identity>'s dev.to account — no duplicate article` (identity read from the stored flag, e.g. `pending:tessera` → "I checked Tessera's dev.to account…"). A generic "I checked dev.to" is not enough — an unknown outcome on a Tessera submit must not be cleared by checking Kurt's dashboard. The checkbox is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
+5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` and the confirmation checkbox renders (rule 4, with the stored identity in the label) — a reloaded tab always has an exit hatch; the only way to be stuck is to never confirm.
 6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets. The **image picker re-enables while locked** (the locked dev.to cannot go out, so an image for Bluesky/LinkedIn is legitimate): the picker is disabled iff dev.to is targeted AND not locked — `disabled={devto && !devtoLocked}`. **Reset while locked:** clears text/article fields, file, and results, but the dev.to checkbox stays checked+disabled and the flag/confirmation requirement is untouched — Reset can never end a lock.
 7. Double-click guard: the submit handler checks the `submitting` ref synchronously and returns if it is already set (state updates are async; the ref is not), sets it before any fetch, and clears it in a `finally`. The Publish button is disabled while `submitting`. A double-click can therefore never send two devto requests in one session.
 
@@ -1328,11 +1368,11 @@ describe("dev.to submit-time lock", () => {
     const f = healthThen(created);
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
-    expect(sessionStorage.getItem("crosspost.devtoPending")).toBe("1");
-    expect((screen.getByLabelText(/dev\.to/i) as HTMLInputElement).disabled).toBe(true);
+    expect(sessionStorage.getItem("crosspost.devtoPending")).toBe("pending:kurt"); // default identity rides in the flag
+    expect((screen.getByRole("checkbox", { name: /^dev\.to$/i }) as HTMLInputElement).disabled).toBe(true);
     await screen.findByText("https://dev.to/x"); // the created row links the article url
     expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull();
   });
@@ -1341,12 +1381,12 @@ describe("dev.to submit-time lock", () => {
     const f = healthThen(unknownRow);
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
-    await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
-    expect(sessionStorage.getItem("crosspost.devtoPending")).toBe("1");
-    fireEvent.click(screen.getByLabelText(/checked dev\.to/i));
+    await waitFor(() => screen.getByLabelText(/checked .+dev\.to account/i));
+    expect(sessionStorage.getItem("crosspost.devtoPending")).toBe("pending:kurt");
+    fireEvent.click(screen.getByLabelText(/checked .+dev\.to account/i));
     expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull();
   });
 
@@ -1354,20 +1394,20 @@ describe("dev.to submit-time lock", () => {
     const f = healthThen(rejectedRow);
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await waitFor(() => expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull());
   });
 
   it("survives a reload: re-mount with the pending flag keeps the lock", async () => {
-    sessionStorage.setItem("crosspost.devtoPending", "1");
+    sessionStorage.setItem("crosspost.devtoPending", "pending:kurt");
     vi.stubGlobal("fetch", healthThen(created));
     render(<App />);
-    const devtoBox = screen.getByLabelText(/dev\.to/i) as HTMLInputElement;
+    const devtoBox = screen.getByRole("checkbox", { name: /^dev\.to$/i }) as HTMLInputElement;
     expect(devtoBox.disabled).toBe(true);
     expect(devtoBox.checked).toBe(true); // spec rule 6: locked checkbox renders checked
-    await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
+    await waitFor(() => screen.getByLabelText(/checked .+dev\.to account/i));
   });
 
   it("an unlocked combined dev.to+Bluesky submit carries both targets in one JSON body", async () => {
@@ -1380,7 +1420,7 @@ describe("dev.to submit-time lock", () => {
     vi.stubGlobal("fetch", f);
     render(<App />);
     fireEvent.change(screen.getByLabelText(/post text/i), { target: { value: "short post" } });
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     fireEvent.click(screen.getByLabelText(/bluesky/i));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
@@ -1399,7 +1439,7 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: true, resultKind: "created", url: "https://dev.to/x" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await screen.findByText("https://dev.to/x");
@@ -1415,11 +1455,11 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: false, resultKind: "unknown", message: "may exist" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(true); // targeted, not locked
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
-    await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
+    await waitFor(() => screen.getByLabelText(/checked .+dev\.to account/i));
     expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(false); // locked → dev.to cannot go out → image usable
   });
 
@@ -1427,14 +1467,17 @@ describe("dev.to submit-time lock", () => {
     vi.stubGlobal("fetch", healthThen(created));
     render(<App />);
     await waitFor(() => screen.getByLabelText(/publish as/i));
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
-    expect(screen.getByLabelText(/publish as/i).textContent).toMatch(/Tessera/);
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
+    const select = screen.getByLabelText(/publish as/i) as HTMLSelectElement;
+    expect(select.value).toBe("kurt"); // default = first identity
+    fireEvent.change(select, { target: { value: "tessera" } });
+    expect((select as HTMLSelectElement).value).toBe("tessera");
   });
 
   it("disables the image picker when dev.to is checked", async () => {
     vi.stubGlobal("fetch", healthThen(created));
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(true);
   });
 
@@ -1445,10 +1488,10 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "bluesky", ok: false, message: "not configured" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
-    await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
+    await waitFor(() => screen.getByLabelText(/checked .+dev\.to account/i));
     // now fill the short-form text and submit again with Bluesky alongside the locked dev.to
     fireEvent.change(screen.getByLabelText(/post text/i), { target: { value: "short post" } });
     fireEvent.click(screen.getByLabelText(/bluesky/i));
@@ -1471,7 +1514,7 @@ describe("dev.to submit-time lock", () => {
       .mockReturnValueOnce(new Promise((res) => { resolveFirst = res; })); // first publish hangs until we resolve it
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     const publish = screen.getByRole("button", { name: /publish now/i });
     fireEvent.click(publish);
@@ -1487,7 +1530,7 @@ describe("dev.to submit-time lock", () => {
       .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: "dev.to does not support images in v1" }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
-    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    fireEvent.click(screen.getByRole("checkbox", { name: /^dev\.to$/i }));
     await fillArticleForm();
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
     await waitFor(() => expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull());
@@ -1495,7 +1538,7 @@ describe("dev.to submit-time lock", () => {
 });
 ```
 
-(Label text is part of the contract: `dev.to` for the target checkbox, `Post text` for the short-form textarea, `Post title`, `Article body`, `Optional image`, `publish as` for the identity selector, `checked dev.to` inside the confirmation label, `bluesky` for the Bluesky checkbox. Adjust `getByLabelText` regexes only if a test proves ambiguous — then update BOTH sides.)
+(Label text is part of the contract: the dev.to checkbox's accessible name is EXACTLY `dev.to` — query it with `getByRole("checkbox", { name: /^dev\.to$/i })`, NEVER `getByLabelText(/dev\.to/i)`, because the confirmation label ("I checked Tessera's dev.to account…") also contains "dev.to" and would make the loose regex throw on multiple matches. Other labels: `Post text` for the short-form textarea, `Post title`, `Article body`, `Optional image`, `publish as` for the identity selector (options carry `value="kurt"` / `value="tessera"`), and the confirmation label matches /checked .+dev\.to account/i. Adjust regexes only if a test proves ambiguous — then update BOTH sides.)
 
 - [ ] **Step 2: Run to verify failure** — Run: `npm test`. Expected: FAIL (no dev.to UI yet).
 
@@ -1503,8 +1546,8 @@ describe("dev.to submit-time lock", () => {
   - `useEffect` on mount: `fetch("/api/health")` → set `identities`, with `.catch(() => setIdentities([]))` — an unhandled health-fetch rejection fails `tests/ui/smoke.test.tsx`, which renders `App` without stubbing `fetch`; also stub `fetch` in the smoke test for determinism. Read `sessionStorage["crosspost.devtoPending"]` → set `devtoLocked`.
   - When `devto` checked: render title input (`Post title`, maxLength 128), article textarea (`Article body`, maxLength 400000), canonical URL input (placeholder showing the apex-host rule), description input with a live `~140` counter (`description.length` shown; display-only), tags input (comma-separated, ≤ 4 after normalization). Hide the short-form text requirement: when devto-only, `canPublish` requires a non-empty title + body instead of text.
   - Identity selector `<select aria-label="publish as">` rendered only when `identities.length > 1`, options labeled `Kurt` / `Tessera`, default = first identity.
-  - Image picker input gets `disabled={devto}` and clearing `file` when devto is toggled on.
-  - Submit per the **Submit path** above; lock rules 1–6 exactly.
+  - Image picker input gets `disabled={devto && !devtoLocked}` (rule 6: re-enables while locked) and clearing `file` when devto is toggled on.
+  - Submit per the **Submit path** above; lock rules 1–7 exactly.
   - Result rows render the `url` as a link when present.
   - Add a `Reset` button: clears text/article fields/file/results, does NOT touch `crosspost.devtoPending` or the confirmation requirement.
 
