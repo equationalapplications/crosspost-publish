@@ -283,7 +283,7 @@ describe("normalizeTags", () => {
 
 - [ ] **Step 2: Run tests to verify they fail** — Run: `npm test`. Expected: FAIL (module `devto-validation` does not exist).
 
-- [ ] **Step 3: Extend `server/publishers/types.ts`** — add `DevtoIdentity`, `DevtoArticle`, and the three field additions listed in Interfaces (exact shapes above; `PublishTargets` gains `devto: boolean` + optional `devtoIdentity?: DevtoIdentity` — other publishers never read it).
+- [ ] **Step 3: Extend `server/publishers/types.ts`** — add `DevtoIdentity`, `DevtoArticle`, and the three field additions listed in Interfaces (exact shapes above; `PublishTargets` gains `devto?: boolean` + optional `devtoIdentity?: DevtoIdentity` — other publishers never read it).
 
 - [ ] **Step 4: Write the minimal implementation** — `server/publishers/devto-validation.ts`:
 
@@ -748,14 +748,13 @@ const base = `http://127.0.0.1:${port}`;
 afterAll(() => server.close());
 
 beforeEach(() => {
+  vi.stubEnv("DEVTO_API_BASE_OVERRIDE", base); // stubEnv: unstubAllEnvs restores setup.ts's closed-port guard
   vi.stubEnv("DEVTO_API_KEY", "test-kurt-key");
   vi.stubEnv("DEVTO_API_KEY_TESSERA", "test-tessera-key");
-  process.env.DEVTO_API_BASE_OVERRIDE = base;
   requests = 0;
 });
 afterEach(() => {
-  vi.unstubAllEnvs();
-  delete process.env.DEVTO_API_BASE_OVERRIDE;
+  vi.unstubAllEnvs(); // restores setup.ts's closed-port override — never delete it
 });
 
 const ctx = {
@@ -954,7 +953,7 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
   }
   let parsed: { id?: number; url?: string; error?: string; status?: string } = {};
   try {
-    parsed = JSON.parse(bodyText) as typeof parsed;
+    parsed = (JSON.parse(bodyText) ?? {}) as typeof parsed; // null body → {} (a JSON `null` would throw on .id/.error below)
   } catch {
     // non-JSON body: fall through to the status-based branches
   }
@@ -1012,18 +1011,21 @@ import { publishDevto } from "./devto.js";
 import { isDevtoKeyConfigured } from "./devto-validation.js";
 import type { DevtoIdentity, PublishContext, PublishResult, PublishTargets } from "./types.js";
 
-type Job = { networkId: string; promise: Promise<PublishResult> };
+type Job = { label: string; networkId: string; promise: Promise<PublishResult> };
 
 // Full publishAll — bluesky/linkedin branches keep their existing logic, wrapped as
-// Jobs so the allSettled fallback can name the network on a rejected promise.
+// Jobs so the allSettled fallback can name the network on a rejected promise. devto
+// jobs carry an identity label so even a fallback row names the account (spec
+// §per-network reporting: EVERY devto message names the identity).
 export async function publishAll(ctx: PublishContext, targets: PublishTargets): Promise<PublishResult[]> {
   const jobs: Job[] = [];
 
   if (targets.bluesky) {
     if (isBlueskyConfigured()) {
-      jobs.push({ networkId: "bluesky", promise: publishBluesky(ctx) });
+      jobs.push({ label: "bluesky", networkId: "bluesky", promise: publishBluesky(ctx) });
     } else {
       jobs.push({
+        label: "bluesky",
         networkId: "bluesky",
         promise: Promise.resolve({
           networkId: "bluesky",
@@ -1036,9 +1038,10 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
 
   if (targets.linkedin) {
     if (isLinkedInConfigured()) {
-      jobs.push({ networkId: "linkedin", promise: publishLinkedIn(ctx) });
+      jobs.push({ label: "linkedin", networkId: "linkedin", promise: publishLinkedIn(ctx) });
     } else {
       jobs.push({
+        label: "linkedin",
         networkId: "linkedin",
         promise: Promise.resolve({
           networkId: "linkedin",
@@ -1055,10 +1058,11 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
   if (targets.devto) {
     const identity: DevtoIdentity | undefined = targets.devtoIdentity;
     if (identity && isDevtoKeyConfigured(identity)) {
-      jobs.push({ networkId: "devto", promise: publishDevto(ctx, identity) });
+      jobs.push({ label: `dev.to (${identity})`, networkId: "devto", promise: publishDevto(ctx, identity) });
     } else {
       const envName = identity === "tessera" ? "DEVTO_API_KEY_TESSERA" : "DEVTO_API_KEY";
       jobs.push({
+        label: `dev.to (${identity ?? "unresolved"})`,
         networkId: "devto",
         promise: Promise.resolve({
           networkId: "devto",
@@ -1071,9 +1075,8 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
   }
 
   // collection: allSettled, so a rejecting publisher can never drop another network's
-  // row — and the fallback row carries the JOB's networkId, so the UI's devto rules
-  // still fire (a fallback row with networkId "unknown" would look like a missing
-  // devto row and could be misread as an unlock).
+  // row — and the fallback row carries the JOB's networkId (and the devto identity
+  // label), so the UI's devto rules still fire and the message still names the account.
   const settled = await Promise.allSettled(jobs.map((j) => j.promise));
   return settled.map((s, i) =>
     s.status === "fulfilled"
@@ -1085,7 +1088,7 @@ export async function publishAll(ctx: PublishContext, targets: PublishTargets): 
           // networks' fallback rows leave it undefined — the UI's devto rules
           // read devto rows only, and undefined is fail-closed for them anyway.
           ...(jobs[i].networkId === "devto" ? { resultKind: "unknown" as const } : {}),
-          message: `Internal error (${jobs[i].networkId}): ${String(s.reason)}`,
+          message: `Internal error (${jobs[i].label}): ${String(s.reason)}`,
         },
   );
 }
@@ -1621,7 +1624,7 @@ describe("dev.to submit-time lock", () => {
   - `useEffect` on mount: `fetch("/api/health")` → set `identities`, with `.catch(() => setIdentities([]))` — an unhandled health-fetch rejection fails `tests/ui/smoke.test.tsx`, which renders `App` without stubbing `fetch`; also stub `fetch` in the smoke test for determinism. Read `sessionStorage["crosspost.devtoPending"]` → set `devtoLocked`.
   - When `devto` checked: render title input (`Post title`, maxLength 128), article textarea (`Article body`, maxLength 400000), canonical URL input (placeholder showing the apex-host rule), description input with a live `~140` counter (`description.length` shown; display-only), tags input (comma-separated, ≤ 4 after normalization). Hide the short-form text requirement: when devto-only, `canPublish` requires a non-empty title + body instead of text.
   - Identity selector `<select aria-label="publish as">` rendered only when `identities.length > 1`, options labeled `Kurt` / `Tessera`, default = first identity.
-  - Image picker input gets `disabled={devto && !devtoLocked}` (rule 6: re-enables while locked) and clearing `file` when devto is toggled on.
+  - Image picker input gets `disabled={devto && !devtoLocked}` (rule 6: re-enables while locked) and clearing `file` when devto is toggled on. The file input gets `id="image"` and its `<label>` gets `htmlFor="image"` — the tests query `getByLabelText(/optional image/i)` and the current markup has no association.
   - Submit per the **Submit path** above; lock rules 1–7 exactly.
   - Result rows render the `url` as a link when present.
   - Add a `Reset` button: clears text/article fields/file/results, does NOT touch `crosspost.devtoPending` or the confirmation requirement.
