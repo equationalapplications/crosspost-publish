@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { publishDevto, DEVTO_API_BASE } from "../../server/publishers/devto.js";
 
 let requests = 0;
-let mode: "ok" | "500" | "hang" | "422" | "429" | "html201" = "ok";
+let mode: "ok" | "500" | "hang" | "422" | "429" | "html201" | "nullid" = "ok";
 
 const server: Server = createServer((req, res) => {
   requests += 1;
@@ -14,6 +14,11 @@ const server: Server = createServer((req, res) => {
     // captive-portal / proxy style: 2xx with a non-JSON body
     res.writeHead(201, { "content-type": "text/html" });
     res.end("<html>ok</html>");
+  } else if (mode === "nullid") {
+    // hostile 2xx: JSON body whose id is not a number — the runtime guard must
+    // treat it as an unknown outcome (the static cast validates nothing)
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: null, url: "https://dev.to/kurt/test-article" }));
   } else if (mode === "422") {
     res.writeHead(422, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Validation failed", status: "422" }));
@@ -100,6 +105,14 @@ describe("publishDevto", () => {
     expect(requests).toBe(1);
     expect(r.ok).toBe(false);
     expect(r.resultKind).toBe("unknown"); // the UI duplicate guard must stay locked
+  });
+
+  it("maps a 2xx with a non-numeric id to an unknown outcome, never `created`", async () => {
+    mode = "nullid";
+    const r = await publishDevto(ctx, "kurt");
+    expect(requests).toBe(1);
+    expect(r.ok).toBe(false);
+    expect(r.resultKind).toBe("unknown"); // id: null cannot identify an article — guard stays locked
   });
 
   it("returns a missing-key failure naming the env var when the identity key is absent", async () => {
