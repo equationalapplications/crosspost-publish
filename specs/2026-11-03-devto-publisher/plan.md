@@ -255,6 +255,9 @@ export function validateArticle(article: DevtoArticle): string[] {
   // any .length/.map access, so a malformed article is a 400, never a 500.
   const title = typeof article.title === "string" ? article.title : "";
   const bodyMarkdown = typeof article.bodyMarkdown === "string" ? article.bodyMarkdown : "";
+  if (article.tags !== undefined && !Array.isArray(article.tags)) {
+    errors.push("tags must be an array of strings");
+  }
   const tags = Array.isArray(article.tags)
     ? article.tags.filter((t): t is string => typeof t === "string")
     : [];
@@ -327,6 +330,10 @@ describe("isDisclosurePresent", () => {
   it("does not match when the disclosure is absent", () => {
     expect(isDisclosurePresent("A perfectly ordinary post by a human.")).toBe(false);
   });
+
+  it("matches curly apostrophes (rich-text paste)", () => {
+    expect(isDisclosurePresent(DISCLOSURE_LINE.replace(/'/g, "\u2019"))).toBe(true);
+  });
 });
 ```
 
@@ -336,7 +343,9 @@ describe("isDisclosurePresent", () => {
 
 ```ts
 export function normalizeForMatch(s: string): string {
-  return s.toLowerCase().replace(/\s+/g, " ").trim();
+  // \u2019 (curly right single quote) → straight apostrophe: rich-text editors emit
+  // curly quotes and a compliant Tessera post must not 400 on paste.
+  return s.toLowerCase().replace(/[\u2018\u2019\u02BC]/g, "'").replace(/\s+/g, " ").trim();
 }
 
 export function isDisclosurePresent(bodyMarkdown: string): boolean {
@@ -653,7 +662,7 @@ import { createServer, type Server } from "node:http";
 import { publishDevto, DEVTO_API_BASE } from "../../server/publishers/devto.js";
 
 let requests = 0;
-let mode: "ok" | "500" | "hang" | "422" = "ok";
+let mode: "ok" | "500" | "hang" | "422" | "429" = "ok";
 
 const server: Server = createServer((req, res) => {
   requests += 1;
@@ -663,6 +672,9 @@ const server: Server = createServer((req, res) => {
   } else if (mode === "422") {
     res.writeHead(422, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "Validation failed", status: "422" }));
+  } else if (mode === "429") {
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Too many requests", status: "429" }));
   } else if (mode === "500") {
     res.writeHead(500, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "boom" }));
@@ -726,6 +738,15 @@ describe("publishDevto", () => {
     expect(r.ok).toBe(false);
     expect(r.resultKind).toBe("rejected");
     expect(r.message).toMatch(/Validation failed/);
+  });
+
+  it("maps a 429 rate limit to an unknown outcome (must NOT auto-unlock the UI)", async () => {
+    mode = "429";
+    const r = await publishDevto(ctx, "kurt");
+    expect(requests).toBe(1);
+    expect(r.ok).toBe(false);
+    expect(r.resultKind).toBe("unknown");
+    expect(r.message).toMatch(/429/);
   });
 
   it("returns a missing-key failure naming the env var when the identity key is absent", async () => {
@@ -848,6 +869,11 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
   if (res.status >= 500) {
     return unknownOutcome(`dev.to returned ${res.status}`);
   }
+  if (res.status === 429) {
+    // A rate limit says nothing about whether an earlier request landed — same
+    // unknown-outcome treatment as 5xx so the UI lock never auto-releases on it.
+    return unknownOutcome("dev.to rate-limited the request (429)");
+  }
   let parsed: { id?: number; url?: string; error?: string; status?: string } = {};
   try {
     parsed = JSON.parse(bodyText) as typeof parsed;
@@ -897,42 +923,52 @@ git commit -m "feat(devto): Forem publisher, never-auto-retry, created/rejected/
 
 ```ts
 import { publishDevto } from "./devto.js";
-import { isDevtoKeyConfigured, devtoIdentities } from "./devto-validation.js";
+import { isDevtoKeyConfigured } from "./devto-validation.js";
 import type { DevtoIdentity, PublishContext, PublishResult, PublishTargets } from "./types.js";
 
-// inside publishAll — identity comes from targets ONLY (route sets it from rules.identity):
+type Job = { networkId: string; promise: Promise<PublishResult> };
+const jobs: Job[] = []; // replaces the old Promise<PublishResult>[] — networkId rides with the job
+
+// bluesky / linkedin branches push { networkId: "bluesky" | "linkedin", promise: ... } —
+// same logic as today, only the wrapper changes.
+
+// devto branch — identity comes from targets ONLY. No re-defaulting here: the route
+// sets targets.devtoIdentity from rules.identity, so validation and publishing cannot
+// disagree about identity.
 if (targets.devto) {
-  const identity: DevtoIdentity | undefined = targets.devtoIdentity ?? devtoIdentities()[0];
+  const identity: DevtoIdentity | undefined = targets.devtoIdentity;
   if (identity && isDevtoKeyConfigured(identity)) {
-    jobs.push(publishDevto(ctx, identity));
+    jobs.push({ networkId: "devto", promise: publishDevto(ctx, identity) });
   } else {
     const envName = identity === "tessera" ? "DEVTO_API_KEY_TESSERA" : "DEVTO_API_KEY";
-    jobs.push(
-      Promise.resolve({
+    jobs.push({
+      networkId: "devto",
+      promise: Promise.resolve({
         networkId: "devto",
         ok: false,
         resultKind: "rejected" as const, // deterministic, nothing sent — UI auto-unlocks
         message: `dev.to not configured for this identity: set ${envName} in .env`,
       }),
-    );
+    });
   }
 }
 
-// collection: allSettled, so a rejecting publisher can never drop another network's row
-const settled = await Promise.allSettled(jobs);
-return settled.map((s) =>
+// collection: allSettled, so a rejecting publisher can never drop another network's
+// row — and the fallback row carries the JOB's networkId, so the UI's devto rules
+// still fire (a fallback row with networkId "unknown" would look like a missing
+// devto row and could be misread as an unlock).
+const settled = await Promise.allSettled(jobs.map((j) => j.promise));
+return settled.map((s, i) =>
   s.status === "fulfilled"
     ? s.value
     : {
-        networkId: "unknown",
+        networkId: jobs[i].networkId,
         ok: false,
         resultKind: "unknown" as const,
         message: `Internal error: ${String(s.reason)}`,
       },
 );
 ```
-
-(Reformat `publishAll` so each job tracks its networkId for the rejected-promise fallback — e.g. build `Array<{networkId: string; promise: Promise<PublishResult>}>` and map over settled results by index. The existing bluesky/linkedin branches stay Promise-based and unchanged in behavior. Import `DevtoIdentity` from `./types.js` — one spelling, no alias games.)
 
 - [ ] **Step 2: Wire the route** — in `server/index.ts`, restructure into an exported `createApp()` so the REAL app is testable (this is what catches identity-dropping wiring bugs the pure module cannot see):
 
@@ -999,20 +1035,26 @@ app.get("/api/health", (_req, res) => {
 - [ ] **Step 3: Route tests against the REAL app** — `tests/server/publish-route.test.ts` boots `createApp()` on port 0 and speaks HTTP, with the Forem stub from `devto.test.ts` behind `DEVTO_API_BASE_OVERRIDE`. This is the test that would have caught the identity-dropping bug:
 
 ```ts
-import { describe, it, expect, afterAll, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, afterAll, beforeAll, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createApp } from "../../server/index.js";
 
+// Deterministic bluesky rejection via module mock — no env-var roulette: the real
+// isBlueskyConfigured may treat an empty handle as configured, so forcing failure
+// through env values alone is not reliable.
+vi.mock("../../server/publishers/bluesky.js", () => ({
+  isBlueskyConfigured: () => true,
+  publishBluesky: async () => ({ networkId: "bluesky", ok: false, message: "stubbed bluesky failure" }),
+}));
+
 let appUrl = "";
 let forseen: { apiKey?: string; body?: string } = {};
-let forremode: "ok" | "hang" = "ok";
 
 const forem: Server = createServer((req, res) => {
   forseen = { apiKey: req.headers["api-key"] as string | undefined, body: "" };
   req.on("data", (c: Buffer) => { forseen.body += c.toString(); });
   req.on("end", () => {
-    if (forremode === "hang") return; // hang: client aborts
     res.writeHead(201, { "content-type": "application/json" });
     res.end(JSON.stringify({ id: 42, url: "https://dev.to/t/article" }));
   });
@@ -1021,17 +1063,21 @@ const forem: Server = createServer((req, res) => {
 beforeAll(async () => {
   forem.listen(0, "127.0.0.1");
   const fport = (forem.address() as AddressInfo).port;
-  process.env.DEVTO_API_BASE_OVERRIDE = `http://127.0.0.1:${fport}`;
-  process.env.DEVTO_API_KEY = "kurt-route-key";
-  process.env.DEVTO_API_KEY_TESSERA = "tessera-route-key";
+  // vi.stubEnv: every assignment is undone by the single unstubAllEnvs in afterAll —
+  // no direct process.env writes, no cross-file leakage.
+  vi.stubEnv("DEVTO_API_BASE_OVERRIDE", `http://127.0.0.1:${fport}`);
+  vi.stubEnv("DEVTO_API_KEY", "kurt-route-key");
+  vi.stubEnv("DEVTO_API_KEY_TESSERA", "tessera-route-key");
   const app = createApp();
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.on("listening", r));
   appUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 
-afterAll(async () => { forem.close(); });
-afterEach(() => { vi.unstubAllEnvs(); forremode = "ok"; });
+afterAll(() => {
+  vi.unstubAllEnvs();
+  forem.close();
+});
 
 const article = {
   title: "T",
@@ -1072,15 +1118,15 @@ describe("POST /api/publish (real app)", () => {
   });
 
   it("returns per-network rows even when a publisher rejects", async () => {
-    // bluesky with garbage env forces a rejection while devto succeeds
-    process.env.BLUESKY_HANDLE = "";
     const res = await fetch(`${appUrl}/api/publish`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ devto: true, bluesky: true, text: "hello", article }),
     });
-    const json = await res.json() as { results: Array<{ networkId: string }> };
-    expect(json.results.map((r) => r.networkId).sort()).toEqual(["bluesky", "devto"]);
+    const json = await res.json() as { results: Array<{ networkId: string; ok: boolean }> };
+    const rows = json.results.map((r) => r.networkId).sort();
+    expect(rows).toEqual(["bluesky", "devto"]); // both rows present despite the bluesky failure
+    expect(json.results.find((r) => r.networkId === "bluesky")?.ok).toBe(false);
   });
 
   it("health exposes the configured identity list", async () => {
@@ -1091,7 +1137,7 @@ describe("POST /api/publish (real app)", () => {
 });
 ```
 
-(Bluesky's unconfigured behavior comes from its own `isBlueskyConfigured` — check the real bluesky.ts while implementing; if an empty handle still counts as configured, use a value that makes `publishBluesky` reject instead. The assertion is about ROW SHAPE (both networks present), not which one failed.)
+(Note: `createApp()` boots at `NODE_ENV === "test"` without listening, and vitest sets that env var — the `NODE_ENV !== "test"` guard around `listen` in `server/index.ts` is what makes this import safe. If a test run shows the guard is wrong for your vitest version, assert `process.env.NODE_ENV` in the first failing test before changing the guard.)
 
 - [ ] **Step 4: Run to verify pass** — Run: `npm test`. Expected: all PASS.
 
@@ -1119,15 +1165,16 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 
 **sessionStorage key:** `crosspost.devtoPending` (value `"1"`).
 
-**Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })`; when `devtoLocked` → the payload **never contains `devto`, `article`, or `devtoIdentity`** regardless of checkbox state (locked dev.to cannot ride along on a Bluesky/LinkedIn submit); when devto is unchecked → the existing FormData path unchanged.
+**Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })`. When `devtoLocked` → the request is the **existing FormData path for the remaining targets only** — it never contains `devto`, `article`, or `devtoIdentity`, whatever the checkbox shows (locked dev.to cannot ride along on a Bluesky/LinkedIn submit). When devto is unchecked → the existing FormData path unchanged.
 
 **Lock rules (the heart of this task):**
-1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "1"` and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response).
+1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "1"` and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response). A synchronous `submitting` ref is set at the same moment (rule 7).
 2. After the response: if the devto result row has `resultKind === "created"` or `"rejected"` → clear the flag, `devtoLocked = false`.
-3. If the fetch threw (network error), the response status is 5xx, or the devto row has `resultKind === "unknown"` → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row; the only 4xx that stays locked is **429** (rate limit says nothing about whether an earlier request landed).
-4. The confirmation checkbox (label: `I checked dev.to — no duplicate article`) is shown while locked-after-unknown; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
-5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` (reload case).
+3. If the fetch threw (network error), the response status is 5xx or 429, the devto row has `resultKind === "unknown"`, **or dev.to was requested but the results contain no devto row** → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any other **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row.
+4. The confirmation checkbox (label: `I checked dev.to — no duplicate article`) is rendered **whenever `devtoLocked` is true** — after an unknown outcome AND after a reload; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
+5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` and the confirmation checkbox renders (rule 4) — a reloaded tab always has an exit hatch; the only way to be stuck is to never confirm.
 6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets.
+7. Double-click guard: the submit handler checks the `submitting` ref synchronously and returns if it is already set (state updates are async; the ref is not), sets it before any fetch, and clears it in a `finally`. The Publish button is disabled while `submitting`. A double-click can therefore never send two devto requests in one session.
 
 - [ ] **Step 1: Write the failing UI-guard test** — `tests/ui/app-guard.test.tsx` (stub `fetch` with `vi.stubGlobal`; the health call returns `{ ok: true, devtoIdentities: ["kurt", "tessera"] }`):
 
@@ -1215,7 +1262,10 @@ describe("dev.to submit-time lock", () => {
   });
 
   it("never includes dev.to in a payload submitted while locked (other targets ride alone)", async () => {
-    const f = healthThen(unknownRow);
+    const f = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt", "tessera"] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: false, resultKind: "unknown", message: "may exist" }] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ networkId: "bluesky", ok: false, message: "not configured" }] }) });
     vi.stubGlobal("fetch", f);
     render(<App />);
     fireEvent.click(screen.getByLabelText(/dev\.to/i));
@@ -1226,10 +1276,32 @@ describe("dev.to submit-time lock", () => {
     fireEvent.change(screen.getByLabelText(/post text/i), { target: { value: "short post" } });
     fireEvent.click(screen.getByLabelText(/bluesky/i));
     fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
-    await waitFor(() => expect((f as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(2));
-    const secondBody = JSON.stringify((f as ReturnType<typeof vi.fn>).mock.calls[1]?.[1]?.body);
-    expect(secondBody).not.toContain('"devto":true');
-    expect(secondBody).not.toContain("article");
+    await waitFor(() => expect(f).toHaveBeenCalledTimes(3));
+    // call 0 = health, call 1 = first publish (JSON, contains article), call 2 = locked submit:
+    const lockedInit = f.mock.calls[2]?.[1] as RequestInit;
+    const lockedBody = lockedInit.body as FormData;
+    expect(lockedInit.headers && (lockedInit.headers as Record<string, string>)["content-type"]).toBeUndefined(); // FormData path, not JSON
+    expect(lockedBody.get("devto")).toBeNull();
+    expect(lockedBody.get("title")).toBeNull();
+    expect(lockedBody.get("bodyMarkdown")).toBeNull();
+    expect(lockedBody.get("text")).toBe("short post");
+  });
+
+  it("a double-click sends exactly one devto request", async () => {
+    let resolveFirst: (v: unknown) => void = () => {};
+    const f = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt", "tessera"] }) })
+      .mockReturnValueOnce(new Promise((res) => { resolveFirst = res; })); // first publish hangs until we resolve it
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    await fillArticleForm();
+    const publish = screen.getByRole("button", { name: /publish now/i });
+    fireEvent.click(publish);
+    fireEvent.click(publish); // second click while in flight
+    resolveFirst({ ok: true, json: async () => ({ results: [{ networkId: "devto", ok: true, resultKind: "created", url: "https://dev.to/x" }] }) });
+    await waitFor(() => expect(f).toHaveBeenCalledTimes(2)); // health + ONE publish only
+    expect(f.mock.calls.filter((c) => String(c[0]).includes("/api/publish")).length).toBe(1);
   });
 
   it("unlocks on a deterministic 4xx response with no result rows", async () => {
@@ -1246,7 +1318,7 @@ describe("dev.to submit-time lock", () => {
 });
 ```
 
-(Label text is part of the contract: `dev.to` for the target checkbox, `Post title`, `Article body`, `Optional image`, `publish as` for the identity selector, `checked dev.to` inside the confirmation label. Adjust `getByLabelText` regexes only if a test proves ambiguous — then update BOTH sides.)
+(Label text is part of the contract: `dev.to` for the target checkbox, `Post text` for the short-form textarea, `Post title`, `Article body`, `Optional image`, `publish as` for the identity selector, `checked dev.to` inside the confirmation label, `bluesky` for the Bluesky checkbox. Adjust `getByLabelText` regexes only if a test proves ambiguous — then update BOTH sides.)
 
 - [ ] **Step 2: Run to verify failure** — Run: `npm test`. Expected: FAIL (no dev.to UI yet).
 
