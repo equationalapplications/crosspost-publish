@@ -35,6 +35,9 @@ export function createApp(): Express {
   // Rate limit publishes: this server automates real cross-posts, so a runaway local
   // loop hammering /api/publish would spam the actual Bluesky/LinkedIn/dev.to accounts.
   // 20/min is far above any interactive use.
+  // Scoped to the POST route (not app.use): non-POST requests to this path 404 and
+  // must not consume rate-limit tokens, or trivial cross-method noise could exhaust
+  // the limit and lock out legitimate publishes.
   const publishLimiter = rateLimit({
     windowMs: 60_000,
     limit: 20,
@@ -42,9 +45,8 @@ export function createApp(): Express {
     legacyHeaders: false,
     message: { error: "Too many publish requests — wait a minute and retry" },
   });
-  app.use("/api/publish", publishLimiter);
 
-  app.post("/api/publish", upload.single("image"), async (req: Request, res: Response) => {
+  app.post("/api/publish", publishLimiter, upload.single("image"), async (req: Request, res: Response) => {
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       // Annotated PublishTargets: the devtoIdentity assignment below is a type error
