@@ -89,7 +89,18 @@ export function createApp(): Express {
   const clientDist = join(process.cwd(), "dist", "client");
   if (existsSync(join(clientDist, "index.html"))) {
     app.use(express.static(clientDist));
-    app.use((req: Request, res: Response) => {
+    // SPA fallback: sendFile is a file-system access, so CodeQL's
+    // js/missing-rate-limiting requires rate limiting in this handler's chain.
+    // Static assets above go through express.static (not flagged); the fallback
+    // only fires for client-side deep links, where 300/min per IP is far above
+    // any real browser session.
+    const staticLimiter = rateLimit({
+      windowMs: 60_000,
+      limit: 300,
+      standardHeaders: "draft-7",
+      legacyHeaders: false,
+    });
+    app.use(staticLimiter, (req: Request, res: Response) => {
       if (req.path.startsWith("/api")) {
         res.status(404).json({ error: "Not found" });
         return;
