@@ -21,7 +21,7 @@
 - Tessera-authored posts: the server 400s when `devtoIdentity` is `"tessera"` and `bodyMarkdown` lacks the disclosure line — case-insensitive, whitespace-normalised substring match. Disclosure line (exact string): `Posted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.`
 - `/api/publish` request rules: `text` required only when Bluesky or LinkedIn targeted; `devto: true` without `article` → 400; `article` without `devto: true` → 400; article fields + image → 400 (and the UI disables the image picker so users never hit it); at-least-one-destination check includes `devto`.
 - JSON body limit: `2mb` (Express default 100kb would 413 a ≤400k-char non-ASCII `bodyMarkdown`). multer keeps handling multipart; `express.json()` handles JSON.
-- `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx (auto-unlocks the UI lock), `unknown` = timeout/5xx/transport (keeps it locked until the "checked dev.to" confirmation). Only `devto.ts` sets it; other publishers leave it undefined.
+- `PublishResult` gains optional `url?: string` (dev.to article URLs are not derivable from the id) and optional `resultKind?: "created" | "rejected" | "unknown"`. `resultKind` is this plan's carrier for the spec's outcome semantics: `created` = ok row, `rejected` = deterministic 4xx or a nothing-sent failure (auto-unlocks the UI lock), `unknown` = timeout/5xx/transport (keeps it locked until the "checked dev.to" confirmation). Only devto rows carry it (`devto.ts` and the registry's unconfigured-key row); other publishers leave it undefined.
 - Duplicate-article defence is client-side by design (stateless app): sessionStorage-backed submit-time lock, per-browser-tab; closing the tab clears it. Accepted v1 tradeoff — do not add server-side state.
 - ESLint + `npm run build` must pass at every commit; existing behavior (Bluesky/LinkedIn FormData path) must not regress.
 
@@ -51,9 +51,22 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    environmentMatchGlobs: [
-      ["tests/ui/**", "jsdom"],
-      ["tests/server/**", "node"],
+    // environmentMatchGlobs is deprecated/removed in current vitest — use projects.
+    projects: [
+      {
+        test: {
+          name: "server",
+          environment: "node",
+          include: ["tests/server/**/*.test.ts"],
+        },
+      },
+      {
+        test: {
+          name: "ui",
+          environment: "jsdom",
+          include: ["tests/ui/**/*.test.tsx"],
+        },
+      },
     ],
   },
 });
@@ -192,6 +205,13 @@ describe("validateArticle", () => {
   it("accepts a description of any length (counter-surface only)", () => {
     expect(validateArticle({ ...good, description: "x".repeat(500) })).toEqual([]);
   });
+
+  it("returns errors, never throws, on malformed untrusted fields", () => {
+    expect(validateArticle({ ...good, title: undefined as unknown as string }).length).toBeGreaterThan(0);
+    expect(validateArticle({ ...good, title: 42 as unknown as string }).length).toBeGreaterThan(0);
+    expect(validateArticle({ ...good, bodyMarkdown: null as unknown as string }).length).toBeGreaterThan(0);
+    expect(validateArticle({ ...good, tags: "a,b" as unknown as string[] }).length).toBeGreaterThan(0);
+  });
 });
 
 describe("normalizeTags", () => {
@@ -231,13 +251,23 @@ const CANONICAL_HOST = "equationalapplications.com";
 
 export function validateArticle(article: DevtoArticle): string[] {
   const errors: string[] = [];
-  if (!article.title || !article.title.trim()) errors.push("title is required");
-  if (article.title.length > 128) errors.push("title must be 128 characters or fewer");
-  if (!article.bodyMarkdown || !article.bodyMarkdown.trim()) errors.push("bodyMarkdown is required");
-  if (article.bodyMarkdown.length > 400_000) {
+  // Route bodies come from untrusted JSON: every field gets a typeof guard BEFORE
+  // any .length/.map access, so a malformed article is a 400, never a 500.
+  const title = typeof article.title === "string" ? article.title : "";
+  const bodyMarkdown = typeof article.bodyMarkdown === "string" ? article.bodyMarkdown : "";
+  const tags = Array.isArray(article.tags)
+    ? article.tags.filter((t): t is string => typeof t === "string")
+    : [];
+  if (Array.isArray(article.tags) && tags.length !== article.tags.length) {
+    errors.push("tags must be an array of strings");
+  }
+  if (!title || !title.trim()) errors.push("title is required");
+  if (title.length > 128) errors.push("title must be 128 characters or fewer");
+  if (!bodyMarkdown || !bodyMarkdown.trim()) errors.push("bodyMarkdown is required");
+  if (bodyMarkdown.length > 400_000) {
     errors.push("bodyMarkdown must be 400,000 characters or fewer");
   }
-  if (normalizeTags(article.tags).length > 4) errors.push("at most 4 tags are allowed");
+  if (normalizeTags(tags).length > 4) errors.push("at most 4 tags are allowed");
   if (article.canonicalUrl !== undefined) {
     let host = "";
     try {
@@ -316,6 +346,12 @@ export function isDisclosurePresent(bodyMarkdown: string): boolean {
 
 - [ ] **Step 4: Run to verify pass** — Run: `npm test`. Expected: all PASS.
 
+(Adjudicated limitation, recorded for the reviewer: `isDisclosurePresent` is a substring
+match — the disclosure line inside an HTML comment or code fence also satisfies it.
+Accepted for v1; the guard's purpose is preventing UNATTRIBUTED Tessera posts, and a
+user deliberately hiding the disclosure inside a fence is a different problem. Do not
+"fix" this without a new spec decision.)
+
 - [ ] **Step 5: Lint + build, commit**
 
 ```bash
@@ -347,10 +383,16 @@ export type PublishRequestRulesInput = {
   hasImage: boolean;
 };
 export type PublishRequestRulesResult =
-  | { ok: true; text: string; article?: DevtoArticle }
+  | { ok: true; text: string; article?: DevtoArticle; identity?: DevtoIdentity }
   | { ok: false; status: 400; error: string };
 export function validatePublishRequest(input: PublishRequestRulesInput): PublishRequestRulesResult;
 ```
+
+(The ok branch ALWAYS carries `identity` — the resolved identity, defaulted from the
+first configured entry. The route must copy `rules.identity` into `targets.devtoIdentity`
+before calling `publishAll`; the registry reads only `targets.devtoIdentity`. Passing the
+identity out-of-band via the raw request body would silently drop the default and the
+disclosure check would run against a different identity than the one that publishes.)
 
 - [ ] **Step 1: Write failing tests** (append; stub env vars with `vi.stubEnv`):
 
@@ -491,6 +533,18 @@ describe("validatePublishRequest", () => {
       hasImage: false,
     });
     expect(r.ok).toBe(true); // Kurt default: no disclosure requirement
+    if (r.ok) expect(r.identity).toBe("kurt");
+  });
+
+  it("returns the chosen identity on the ok branch so the route can pass it to publishAll", () => {
+    const r = validatePublishRequest({
+      targets: { bluesky: false, linkedin: false, devto: true },
+      article: { title: "T", bodyMarkdown: `x\n\nPosted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.` },
+      devtoIdentity: "tessera",
+      hasImage: false,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.identity).toBe("tessera");
   });
 });
 ```
@@ -547,12 +601,12 @@ export function validatePublishRequest(
   if (targets.devto && hasImage) {
     return { ok: false, status: 400, error: "dev.to does not support images in v1" };
   }
-  const identity: DevtoIdentity = isDevtoIdentity(input.devtoIdentity)
-    ? input.devtoIdentity
-    : devtoIdentities()[0];
   if (targets.devto && input.devtoIdentity !== undefined && !isDevtoIdentity(input.devtoIdentity)) {
     return { ok: false, status: 400, error: "Unknown dev.to identity" };
   }
+  const identity: DevtoIdentity | undefined = isDevtoIdentity(input.devtoIdentity)
+    ? input.devtoIdentity
+    : devtoIdentities()[0];
   let article: DevtoArticle | undefined;
   if (targets.devto && articleGiven) {
     article = input.article as DevtoArticle;
@@ -562,7 +616,7 @@ export function validatePublishRequest(
       return { ok: false, status: 400, error: "Tessera-authored posts must include the disclosure line" };
     }
   }
-  return articleGiven && targets.devto ? { ok: true, text, article } : { ok: true, text };
+  return articleGiven && targets.devto ? { ok: true, text, article, identity } : { ok: true, text, identity };
 }
 ```
 
@@ -709,7 +763,12 @@ describe("publishDevto", () => {
 });
 ```
 
-(Implementation note: `publishDevto` reads its base URL as `process.env.DEVTO_API_BASE_OVERRIDE ?? DEVTO_API_BASE`. The override exists solely so tests hit a local stub with the real fetch path; production code never sets it. Do not introduce a fetch-mocking library — the spec's retry rule is about the real request lifecycle. `import { vi } from "vitest"` at the top alongside the other vitest imports.)
+(Implementation note: `publishDevto` reads its base URL as `base()`, which honors
+`DEVTO_API_BASE_OVERRIDE` **only when `NODE_ENV === "test"`** — the override exists
+solely so tests hit a local stub with the real fetch path; production code never sets
+it, and a stray value outside tests is ignored so the `api-key` header can never be
+redirected to a foreign host. Do not introduce a fetch-mocking library — the spec's
+retry rule is about the real request lifecycle.)
 
 - [ ] **Step 2: Run to verify failure** — Run: `npm test`. Expected: FAIL (module missing).
 
@@ -723,7 +782,12 @@ export const DEVTO_API_BASE = "https://dev.to/api";
 const TIMEOUT_MS = 30_000;
 
 function base(): string {
-  return process.env.DEVTO_API_BASE_OVERRIDE ?? DEVTO_API_BASE;
+  // Test-only override, gated so a stray env var in production can never redirect
+  // the api-key header to an attacker-chosen host.
+  if (process.env.NODE_ENV === "test" && process.env.DEVTO_API_BASE_OVERRIDE) {
+    return process.env.DEVTO_API_BASE_OVERRIDE;
+  }
+  return DEVTO_API_BASE;
 }
 
 function errMsg(e: unknown, fallback: string): string {
@@ -767,6 +831,7 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
     },
   };
   let res: Response;
+  let bodyText = "";
   try {
     res = await fetch(`${base()}/articles`, {
       method: "POST",
@@ -774,13 +839,15 @@ export async function publishDevto(ctx: PublishContext, identity: DevtoIdentity)
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
+    // Inside the try: the 30s abort can fire during the body read — after the
+    // request was sent — and must map to the same unknown-outcome row, not reject.
+    bodyText = await res.text();
   } catch (e: unknown) {
     return unknownOutcome(errMsg(e, "Request to dev.to failed"));
   }
   if (res.status >= 500) {
     return unknownOutcome(`dev.to returned ${res.status}`);
   }
-  const bodyText = await res.text();
   let parsed: { id?: number; url?: string; error?: string; status?: string } = {};
   try {
     parsed = JSON.parse(bodyText) as typeof parsed;
@@ -820,22 +887,22 @@ git commit -m "feat(devto): Forem publisher, never-auto-retry, created/rejected/
 **Files:**
 - Modify: `server/publishers/registry.ts`
 - Modify: `server/index.ts`
-- Test: `tests/server/publish-route.test.ts` (route rules exercised through the pure module — see note)
+- Test: `tests/server/publish-route.test.ts` (boots the real app via `createApp()` on an ephemeral port)
 
 **Interfaces:**
 - Consumes: `validatePublishRequest`, `devtoIdentities`, `isDevtoKeyConfigured`, `publishDevto`.
-- Produces: `publishAll(ctx, targets)` now dispatches devto with the identity from `targets.devtoIdentity ?? devtoIdentities()[0]`; a configured-but-missing-key identity fails per-network naming the env var (matches the existing bluesky/linkedin unconfigured pattern).
+- Produces: `createApp(): Express` exported from `server/index.ts` (the `app.listen` call moves behind a `NODE_ENV !== "test"` guard so tests can boot the real app); `publishAll(ctx, targets)` dispatches devto using ONLY `targets.devtoIdentity` (the route sets it from `rules.identity` — the registry never re-defaults, so validation and publishing cannot disagree about identity); a configured-but-missing-key identity fails per-network naming the env var, with `resultKind: "rejected"` (nothing was sent — the UI must auto-unlock); `publishAll` collects with `Promise.allSettled` so one publisher's rejection can never drop another network's result row.
 
-- [ ] **Step 1: Extend `registry.ts`** — add alongside the existing branches:
+- [ ] **Step 1: Extend `registry.ts`** — add the devto branch and harden the collection:
 
 ```ts
 import { publishDevto } from "./devto.js";
-import { devtoIdentities, isDevtoKeyConfigured, type DevtoIdentity } from "./devto-validation.js";
-import type { DevtoIdentity as DevtoIdentityType } from "./types.js";
+import { isDevtoKeyConfigured, devtoIdentities } from "./devto-validation.js";
+import type { DevtoIdentity, PublishContext, PublishResult, PublishTargets } from "./types.js";
 
-// inside publishAll, before `return Promise.all(jobs)`:
+// inside publishAll — identity comes from targets ONLY (route sets it from rules.identity):
 if (targets.devto) {
-  const identity: DevtoIdentityType = targets.devtoIdentity ?? devtoIdentities()[0];
+  const identity: DevtoIdentity | undefined = targets.devtoIdentity ?? devtoIdentities()[0];
   if (identity && isDevtoKeyConfigured(identity)) {
     jobs.push(publishDevto(ctx, identity));
   } else {
@@ -844,19 +911,49 @@ if (targets.devto) {
       Promise.resolve({
         networkId: "devto",
         ok: false,
+        resultKind: "rejected" as const, // deterministic, nothing sent — UI auto-unlocks
         message: `dev.to not configured for this identity: set ${envName} in .env`,
       }),
     );
   }
 }
+
+// collection: allSettled, so a rejecting publisher can never drop another network's row
+const settled = await Promise.allSettled(jobs);
+return settled.map((s) =>
+  s.status === "fulfilled"
+    ? s.value
+    : {
+        networkId: "unknown",
+        ok: false,
+        resultKind: "unknown" as const,
+        message: `Internal error: ${String(s.reason)}`,
+      },
+);
 ```
 
-(Import both `DevtoIdentity` type spellings only if the validation module re-exports the type; otherwise import `DevtoIdentity` from `./types.js` alone and drop the duplicate. One import, no alias games.)
+(Reformat `publishAll` so each job tracks its networkId for the rejected-promise fallback — e.g. build `Array<{networkId: string; promise: Promise<PublishResult>}>` and map over settled results by index. The existing bluesky/linkedin branches stay Promise-based and unchanged in behavior. Import `DevtoIdentity` from `./types.js` — one spelling, no alias games.)
 
-- [ ] **Step 2: Wire the route** — in `server/index.ts`:
+- [ ] **Step 2: Wire the route** — in `server/index.ts`, restructure into an exported `createApp()` so the REAL app is testable (this is what catches identity-dropping wiring bugs the pure module cannot see):
 
-  - Add `app.use(express.json({ limit: "2mb" }))` immediately after `const app = express();` (global body parsing; multer still owns multipart on `/api/publish`, and `express.json` skips non-JSON content types).
-  - Replace the inline validation in the `/api/publish` handler with a call to the pure module:
+  - Move the app construction into:
+
+```ts
+export function createApp(): Express {
+  const app = express();
+  app.use(express.json({ limit: "2mb" })); // default 100kb would 413 a <=400k-char bodyMarkdown
+  // ...upload, /api/publish, /api/health, static fallback, error middleware...
+  return app;
+}
+
+if (process.env.NODE_ENV !== "test") {
+  createApp().listen(PORT, "127.0.0.1", () => {
+    console.log(`API listening on http://127.0.0.1:${PORT}`);
+  });
+}
+```
+
+  - The `/api/publish` handler — identity passthrough from the validated rules (BLOCKER-1 fix: `targets.devtoIdentity` is set from `rules.identity`, never from the raw body):
 
 ```ts
 app.post("/api/publish", upload.single("image"), async (req: Request, res: Response) => {
@@ -876,6 +973,7 @@ app.post("/api/publish", upload.single("image"), async (req: Request, res: Respo
       res.status(rules.status).json({ error: rules.error });
       return;
     }
+    if (targets.devto) targets.devtoIdentity = rules.identity;
     const ctx = {
       text: rules.text,
       article: rules.article,
@@ -898,28 +996,102 @@ app.get("/api/health", (_req, res) => {
 });
 ```
 
-- [ ] **Step 3: Route-rules test through the pure module** — `tests/server/publish-route.test.ts` does NOT boot the Express app (the module calls `app.listen` at load). Its job is to pin the *wiring contract*: the route must pass exactly the fields above into `validatePublishRequest`. Write it as a guard on the pure module's decision table for the route's two multipart/JSON content shapes:
+- [ ] **Step 3: Route tests against the REAL app** — `tests/server/publish-route.test.ts` boots `createApp()` on port 0 and speaks HTTP, with the Forem stub from `devto.test.ts` behind `DEVTO_API_BASE_OVERRIDE`. This is the test that would have caught the identity-dropping bug:
 
 ```ts
-import { describe, it, expect } from "vitest";
-import { validatePublishRequest } from "../../server/publishers/devto-validation.js";
+import { describe, it, expect, afterAll, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { createApp } from "../../server/index.js";
 
-// Pins the contract the route wiring relies on: JSON bodies present booleans as real
-// booleans, FormData presents them as "1"/"0" strings — parseFlag must treat both
-// identically. If these fail, the route needs a parseFlag fix, not a validation fix.
-describe("route wiring contract", () => {
-  it("string flags from FormData parse like booleans", () => {
-    const r = validatePublishRequest({
-      text: "hello",
-      targets: { bluesky: true as unknown as boolean, linkedin: false, devto: false },
-      hasImage: false,
+let appUrl = "";
+let forseen: { apiKey?: string; body?: string } = {};
+let forremode: "ok" | "hang" = "ok";
+
+const forem: Server = createServer((req, res) => {
+  forseen = { apiKey: req.headers["api-key"] as string | undefined, body: "" };
+  req.on("data", (c: Buffer) => { forseen.body += c.toString(); });
+  req.on("end", () => {
+    if (forremode === "hang") return; // hang: client aborts
+    res.writeHead(201, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: 42, url: "https://dev.to/t/article" }));
+  });
+});
+
+beforeAll(async () => {
+  forem.listen(0, "127.0.0.1");
+  const fport = (forem.address() as AddressInfo).port;
+  process.env.DEVTO_API_BASE_OVERRIDE = `http://127.0.0.1:${fport}`;
+  process.env.DEVTO_API_KEY = "kurt-route-key";
+  process.env.DEVTO_API_KEY_TESSERA = "tessera-route-key";
+  const app = createApp();
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((r) => server.on("listening", r));
+  appUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+afterAll(async () => { forem.close(); });
+afterEach(() => { vi.unstubAllEnvs(); forremode = "ok"; });
+
+const article = {
+  title: "T",
+  bodyMarkdown: `Intro.\n\nPosted by Tessera, Kurt VanDusen's executive AI agent at Equational Applications.`,
+};
+
+describe("POST /api/publish (real app)", () => {
+  it("routes the SELECTED identity's key to dev.to (identity passthrough)", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true, devtoIdentity: "tessera", article }),
     });
-    expect(r.ok).toBe(true);
+    const json = await res.json() as { results: Array<{ networkId: string; ok: boolean }> };
+    expect(json.results.find((r) => r.networkId === "devto")?.ok).toBe(true);
+    expect(forseen.apiKey).toBe("tessera-route-key"); // NOT kurt-route-key
+  });
+
+  it("defaults an omitted identity to Kurt", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true, article }),
+    });
+    await res.json();
+    expect(forseen.apiKey).toBe("kurt-route-key");
+  });
+
+  it("400s on a rule violation without touching dev.to", async () => {
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true }),
+    });
+    expect(res.status).toBe(400);
+    const json = await res.json() as { error: string };
+    expect(json.error).toMatch(/dev\.to requires an article/);
+  });
+
+  it("returns per-network rows even when a publisher rejects", async () => {
+    // bluesky with garbage env forces a rejection while devto succeeds
+    process.env.BLUESKY_HANDLE = "";
+    const res = await fetch(`${appUrl}/api/publish`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ devto: true, bluesky: true, text: "hello", article }),
+    });
+    const json = await res.json() as { results: Array<{ networkId: string }> };
+    expect(json.results.map((r) => r.networkId).sort()).toEqual(["bluesky", "devto"]);
+  });
+
+  it("health exposes the configured identity list", async () => {
+    const res = await fetch(`${appUrl}/api/health`);
+    const json = await res.json() as { devtoIdentities: string[] };
+    expect(json.devtoIdentities).toEqual(["kurt", "tessera"]);
   });
 });
 ```
 
-(If a fuller route-level test is wanted later, extract `createApp()` from `server/index.ts` and boot it on an ephemeral port — out of scope for v1; the spec's test plan covers rules via the pure module.)
+(Bluesky's unconfigured behavior comes from its own `isBlueskyConfigured` — check the real bluesky.ts while implementing; if an empty handle still counts as configured, use a value that makes `publishBluesky` reject instead. The assertion is about ROW SHAPE (both networks present), not which one failed.)
 
 - [ ] **Step 4: Run to verify pass** — Run: `npm test`. Expected: all PASS.
 
@@ -947,15 +1119,15 @@ git commit -m "feat(devto): express.json route wiring, health identities, regist
 
 **sessionStorage key:** `crosspost.devtoPending` (value `"1"`).
 
-**Submit path:** when `devto` is true → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })`; otherwise the existing FormData path unchanged.
+**Submit path:** when `devto` is true AND not locked → `fetch("/api/publish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ devto: true, devtoIdentity, article: { title, bodyMarkdown, canonicalUrl: canonicalUrl || undefined, description: description || undefined, tags: tags ? tags.split(",").map(t => t.trim()).filter(Boolean) : undefined } }) })`; when `devtoLocked` → the payload **never contains `devto`, `article`, or `devtoIdentity`** regardless of checkbox state (locked dev.to cannot ride along on a Bluesky/LinkedIn submit); when devto is unchecked → the existing FormData path unchanged.
 
 **Lock rules (the heart of this task):**
 1. On submit with `devto` targeted: set `sessionStorage["crosspost.devtoPending"] = "1"` and `devtoLocked = true` **before** the fetch (unknown outcome starts at submit, not at response).
 2. After the response: if the devto result row has `resultKind === "created"` or `"rejected"` → clear the flag, `devtoLocked = false`.
-3. If the fetch threw, the response was not ok (HTTP 5xx/4xx at the transport level, no result rows), or the devto row has `resultKind === "unknown"` → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox.
+3. If the fetch threw (network error), the response status is 5xx, or the devto row has `resultKind === "unknown"` → keep the flag, keep `devtoLocked = true`, show the confirmation checkbox. Any **HTTP 4xx response** (400 validation, 413 body limit, unknown identity — none of which can have created an article) **unlocks** exactly like a `rejected` row; the only 4xx that stays locked is **429** (rate limit says nothing about whether an earlier request landed).
 4. The confirmation checkbox (label: `I checked dev.to — no duplicate article`) is shown while locked-after-unknown; ticking it clears the flag and unlocks. Reset clears the form fields but NOT the flag or the confirmation requirement.
 5. On mount: if `sessionStorage["crosspost.devtoPending"]` is set → `devtoLocked = true` (reload case).
-6. While locked: the dev.to checkbox is disabled and checked; if devto was the only target the Publish button is disabled too (the server would 400 on an unlocked retry — the UI never sends one).
+6. While locked: the dev.to checkbox is disabled and checked; the article fieldset renders disabled; if devto was the only target the Publish button is disabled too. A locked dev.to target can NEVER be included in any outgoing payload (see Submit path) — the UI never sends one, whatever else the user targets.
 
 - [ ] **Step 1: Write the failing UI-guard test** — `tests/ui/app-guard.test.tsx` (stub `fetch` with `vi.stubGlobal`; the health call returns `{ ok: true, devtoIdentities: ["kurt", "tessera"] }`):
 
@@ -1040,6 +1212,36 @@ describe("dev.to submit-time lock", () => {
     render(<App />);
     fireEvent.click(screen.getByLabelText(/dev\.to/i));
     expect((screen.getByLabelText(/optional image/i) as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("never includes dev.to in a payload submitted while locked (other targets ride alone)", async () => {
+    const f = healthThen(unknownRow);
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    await fillArticleForm();
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    await waitFor(() => screen.getByLabelText(/checked dev\.to/i));
+    // now fill the short-form text and submit again with Bluesky alongside the locked dev.to
+    fireEvent.change(screen.getByLabelText(/post text/i), { target: { value: "short post" } });
+    fireEvent.click(screen.getByLabelText(/bluesky/i));
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    await waitFor(() => expect((f as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(2));
+    const secondBody = JSON.stringify((f as ReturnType<typeof vi.fn>).mock.calls[1]?.[1]?.body);
+    expect(secondBody).not.toContain('"devto":true');
+    expect(secondBody).not.toContain("article");
+  });
+
+  it("unlocks on a deterministic 4xx response with no result rows", async () => {
+    const f = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, devtoIdentities: ["kurt", "tessera"] }) })
+      .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: "dev.to does not support images in v1" }) });
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    fireEvent.click(screen.getByLabelText(/dev\.to/i));
+    await fillArticleForm();
+    fireEvent.click(screen.getByRole("button", { name: /publish now/i }));
+    await waitFor(() => expect(sessionStorage.getItem("crosspost.devtoPending")).toBeNull());
   });
 });
 ```
